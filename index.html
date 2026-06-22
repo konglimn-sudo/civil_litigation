@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="面向中国民事诉讼场景的 AI 办公工作台" />
+    <title>衡法 AI 办案台</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <section id="auth-view" class="auth-view" hidden>
+      <div class="auth-brand">
+        <div class="brand-mark">衡</div>
+        <div><strong>衡法 AI 办案台</strong><span>安全工作区登录</span></div>
+      </div>
+      <form id="login-form" class="auth-form">
+        <div class="auth-heading"><h1>登录办案工作区</h1><p>案件数据由本地 SQLite 服务加密会话保护。</p></div>
+        <label><span>邮箱</span><input name="email" type="email" autocomplete="username" required value="admin@hengfa.local"></label>
+        <label><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
+        <div id="login-error" class="auth-error" hidden></div>
+        <button class="primary-button auth-submit" type="submit">登录</button>
+      </form>
+      <p class="auth-footnote">仅在可信设备和私有网络中处理案件材料。</p>
+    </section>
+
+    <div id="app-shell" class="app-shell" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">衡</div>
+          <div>
+            <strong>衡法</strong>
+            <span>AI 办案台</span>
+          </div>
+        </div>
+
+        <nav class="primary-nav" aria-label="主导航">
+          <button class="nav-item is-active" type="button" data-route="dashboard">
+            <span class="nav-icon">总</span><span>总览</span>
+          </button>
+          <button class="nav-item" type="button" data-route="cases">
+            <span class="nav-icon">案</span><span>案件管理</span>
+          </button>
+          <button class="nav-item" type="button" data-route="search">
+            <span class="nav-icon">检</span><span>法律检索</span>
+          </button>
+          <button class="nav-item" type="button" data-route="documents">
+            <span class="nav-icon">文</span><span>智能文书</span>
+          </button>
+          <button class="nav-item" type="button" data-route="evidence">
+            <span class="nav-icon">证</span><span>证据管理</span>
+          </button>
+          <button class="nav-item" type="button" data-route="strategy">
+            <span class="nav-icon">策</span><span>案情策略</span>
+          </button>
+          <button class="nav-item" type="button" data-route="qa">
+            <span class="nav-icon">问</span><span>法律问答</span>
+          </button>
+          <button class="nav-item" type="button" data-route="hearing">
+            <span class="nav-icon">庭</span><span>庭审辅助</span>
+          </button>
+          <button class="nav-item" type="button" data-route="execution">
+            <span class="nav-icon">执</span><span>执行管理</span>
+          </button>
+          <button class="nav-item" type="button" data-route="collaboration">
+            <span class="nav-icon">协</span><span>协作办公</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <button class="nav-item" type="button" data-route="platform">
+            <span class="nav-icon">台</span><span>平台与安全</span>
+          </button>
+          <div class="profile" id="current-profile">
+            <div class="avatar" id="profile-avatar">谢</div>
+            <div><strong id="profile-name">办案团队</strong><span id="profile-role">本地工作区</span></div>
+          </div>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div class="case-switcher">
+            <span>当前案件</span>
+            <select id="global-case-select" aria-label="切换当前案件"></select>
+          </div>
+          <div class="topbar-actions">
+            <button class="icon-button" id="quick-search" type="button" title="法律检索" aria-label="法律检索">⌕</button>
+            <button class="icon-button notif-button" id="notifications-button" type="button" title="提醒通知" aria-label="提醒通知" hidden>🔔<span class="notif-count" id="notif-count" hidden>0</span></button>
+            <span class="security-state" id="sync-state"><span></span>正在连接</span>
+            <button class="icon-button" id="logout-button" type="button" title="退出登录" aria-label="退出登录">↪</button>
+            <button class="primary-button" id="top-new-case" type="button" data-action="new-case"><span>＋</span>新建案件</button>
+          </div>
+        </header>
+
+        <section id="app-view" class="app-view" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <dialog id="app-dialog" class="app-dialog">
+      <div id="dialog-content"></div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>

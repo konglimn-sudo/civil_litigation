@@ -1,0 +1,19 @@
+{
+  "name": "hengfa-mobile",
+  "version": "0.3.0",
+  "private": true,
+  "description": "衡法 AI 办案台 安卓本地演示版(Capacitor 封装前端,localStorage 离线运行)",
+  "scripts": {
+    "copy-web": "node copy-web.mjs",
+    "init-android": "npm run copy-web && cap add android",
+    "sync": "npm run copy-web && cap sync android",
+    "build": "npm run copy-web && cap sync android && cd android && ./gradlew assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.2.0",
+    "@capacitor/android": "^6.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^6.2.0"
+  }
+}

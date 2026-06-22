@@ -1,0 +1,11 @@
+{
+  "appId": "com.hengfa.workbench",
+  "appName": "衡法AI办案台",
+  "webDir": "www",
+  "android": {
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

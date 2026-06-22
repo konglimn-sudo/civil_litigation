@@ -1,0 +1,40 @@
+{
+  "name": "hengfa-desktop",
+  "version": "0.3.0",
+  "private": true,
+  "description": "衡法 AI 办案台 桌面端(Electron 封装本地 Node 服务)",
+  "main": "main.js",
+  "scripts": {
+    "copy-app": "node copy-app.mjs",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "start": "npm run copy-app && electron .",
+    "dist": "npm run copy-app && electron-builder",
+    "dist:mac": "npm run copy-app && electron-builder --mac dmg",
+    "dist:win": "npm run copy-app && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "@electron/rebuild": "^3.7.1"
+  },
+  "build": {
+    "appId": "com.hengfa.workbench",
+    "productName": "Hengfa-Workbench",
+    "directories": { "output": "dist", "buildResources": "build" },
+    "files": ["main.js", "app/**/*"],
+    "npmRebuild": true,
+    "mac": {
+      "target": ["dmg"],
+      "category": "public.app-category.productivity",
+      "artifactName": "HengfaWorkbench-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "HengfaWorkbench-${version}-setup.${ext}"
+    },
+    "nsis": { "oneClick": false, "allowToChangeInstallationDirectory": true }
+  }
+}

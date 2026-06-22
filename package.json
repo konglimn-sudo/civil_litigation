@@ -1,0 +1,10 @@
+{
+  "name": "hengfa-civil-litigation-workbench",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "test": "node --test"
+  }
+}
