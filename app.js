@@ -234,7 +234,9 @@ function loadState() {
 }
 
 let state = loadState();
-let activeRoute = "dashboard";
+// 初始路由支持 URL hash 深链(如 #cases),便于分享与按页截图。
+const initialHash = (typeof location !== "undefined" && location.hash ? location.hash : "").replace(/^#/, "");
+let activeRoute = Object.prototype.hasOwnProperty.call(routeMeta, initialHash) ? initialHash : "dashboard";
 let selectedTemplate = "complaint";
 let documentDraft = "";
 let legalQuery = "";
@@ -2851,6 +2853,14 @@ document.querySelector("#quick-search").addEventListener("click", () => {
 
 document.querySelector("#notifications-button").addEventListener("click", () => {
   if (apiMode) notificationsDialog();
+});
+
+window.addEventListener?.("hashchange", () => {
+  const route = (location.hash || "").replace(/^#/, "");
+  if (Object.prototype.hasOwnProperty.call(routeMeta, route) && route !== activeRoute) {
+    activeRoute = route;
+    renderPage();
+  }
 });
 
 loginForm.addEventListener("submit", async event => {

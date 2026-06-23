@@ -2,6 +2,16 @@
 
 根据《民事诉讼 AI 办公软件框架-概要》实现的民事诉讼 AI 办案工作台。后端使用零第三方依赖的 Node.js 与 SQLite（含内置 FTS5 全文检索），并保留直接打开 HTML 的本地演示模式。文字抽取在本机完成、数据不出本地：默认优先使用 Python（PyMuPDF/python-docx）加速器以获得最佳中文 PDF/DOCX 效果，未安装时自动回退到内置的零依赖 Node 抽取（图片 OCR、DOCX、文本、数字 PDF 文本层）。
 
+## 界面预览
+
+> 以下为本地演示模式截图（内置样例数据）。可用 `bash scripts/screenshots.sh` 重新生成至 `docs/screenshots/`。
+
+| 办案总览 | 案件全生命周期 |
+|---|---|
+| ![办案总览](docs/screenshots/dashboard.png) | ![案件全生命周期](docs/screenshots/cases.png) |
+| **智能文书** | **证据管理与分析** |
+| ![智能文书](docs/screenshots/documents.png) | ![证据管理](docs/screenshots/evidence.png) |
+
 ## 已实现模块
 
 - 案件全生命周期台账与关键节点提醒；总览仪表盘**一屏汇总跨案同日庭审冲突与全局逾期节点**，可点击直达对应案件时间轴
