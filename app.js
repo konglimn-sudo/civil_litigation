@@ -1449,6 +1449,35 @@ function generateDocument(template, caseItem) {
   return (templates[template] || templates.complaint) + gapNote + verify;
 }
 
+// 错别字 / 格式校验(纯函数,便于单测):常见法律文书易错词 + 标点/数字/配对等格式问题。
+function proofreadDocument(content) {
+  const text = String(content || "");
+  const findings = [];
+  const add = (level, title, detail) => findings.push({ level, title, detail });
+
+  // 常见法律文书易错词(左错→右正);仅收在法律语境下"左形"基本可判定为错的对子。
+  const TYPO_PAIRS = [
+    ["帐号", "账号"], ["帐户", "账户"], ["帐目", "账目"], ["对帐", "对账"], ["结帐", "结账"], ["记帐", "记账"], ["帐款", "账款"],
+    ["既使", "即使"], ["按步就班", "按部就班"], ["诉讼实效", "诉讼时效"], ["做出判决", "作出判决"], ["做出裁定", "作出裁定"]
+  ];
+  const typos = TYPO_PAIRS.filter(([wrong]) => text.includes(wrong)).map(([wrong, right]) => `「${wrong}」疑应为「${right}」`);
+  if (typos.length) add("medium", "疑似错别字 / 用词", `${typos.join("；")}。`);
+
+  // 连续重复标点(如 。。 ，，)。
+  if (/([，。；：！？、])\1/.test(text)) add("low", "重复标点", "存在连续重复的标点符号，请检查。");
+  // 中文字符旁出现半角标点(中英文标点混用)。
+  if (/[一-龥][,;:?!]|[,;:?!][一-龥]/.test(text)) add("low", "中英文标点混用", "正文疑似混用半角标点，建议统一为全角中文标点。");
+  // 半角与全角数字并存。
+  if (/[0-9]/.test(text) && /[０-９]/.test(text)) add("low", "数字全半角混用", "同时出现半角与全角数字，建议统一。");
+  // 成对符号开合数量不一致。
+  for (const [open, close, name] of [["（", "）", "圆括号"], ["《", "》", "书名号"], ["“", "”", "引号"]]) {
+    const opens = text.split(open).length - 1;
+    const closes = text.split(close).length - 1;
+    if (opens !== closes) add("low", `${name}不配对`, `${name}开合数量不一致（${opens} / ${closes}），请检查。`);
+  }
+  return findings;
+}
+
 // 本地文书审查:检测占位符、主体缺失、未核验证据、缺法律依据等并给出风险条目。
 function reviewDocument(content, caseItem) {
   const findings = [];
@@ -1464,7 +1493,8 @@ function reviewDocument(content, caseItem) {
   if (content.length < 260) add("medium", "文书内容偏短", "建议复核请求、事实、证据分析和结论是否充分展开。 ");
   if (!/依据|法律|民法|诉讼法|司法解释/.test(content)) add("medium", "缺少明确法律依据", "建议补充经正式法源核验的法律依据和引用位置。 ");
   if (caseItem?.amount > 0 && !/[0-9０-９]+[,.，]?[0-9０-９]*\s*元/.test(content)) add("low", "金额表达待复核", "案件有标的额，但正文中未识别到明确的人民币金额表述。 ");
-  if (!findings.length) add("pass", "基础审查通过", "未发现明显占位符、主体缺失或未核验证据引用，仍需人工进行事实与法源复核。 ");
+  findings.push(...proofreadDocument(content)); // 合并错别字/格式校验结果。
+  if (!findings.length) add("pass", "基础审查通过", "未发现明显占位符、主体缺失、未核验证据引用或错别字/格式问题，仍需人工进行事实与法源复核。 ");
   return findings;
 }
 
@@ -1913,7 +1943,42 @@ function renderTranscriptionPanel(caseItem) {
   </section>`;
 }
 
-// 渲染"执行与后续管理"页(执行进度条 + 财产线索台账)。
+// 上诉 / 再审衔接面板:据时间轴的判决/裁定节点推算上诉期限,给出衔接事项清单与快捷动作。
+function renderAppealPanel(caseItem) {
+  if (!caseItem) return "";
+  const events = caseEventsFor(caseItem.id);
+  const judgment = events.find(item => /判决|调解书/.test(`${item.type} ${item.title}`)); // 优先判决/调解书。
+  const ruling = events.find(item => /裁定/.test(`${item.type} ${item.title}`));            // 否则裁定。
+  const ref = judgment || ruling;
+  const days = judgment ? 15 : 10;                                                          // 判决 15 日 / 裁定 10 日。
+  const result = ref?.date ? computeStatutoryDeadline(ref.date, days) : null;               // 复用法定期限推算(末日顺延)。
+  const overdue = result && daysUntil(result.deadline) < 0;
+  const checklist = [
+    "核对一审裁判主文与送达回证（确认实际送达日期）",
+    "确定上诉利益与上诉请求范围",
+    "核验上诉期限：判决 15 日 / 裁定 10 日，自送达次日起算、末日遇节假日顺延",
+    "拟上诉状：就一审事实认定、证据采信与证明责任、法律适用三处提出异议",
+    "向原审法院递交上诉状并按规定缴纳上诉费",
+    "如裁判已生效：审查再审事由（《民事诉讼法》相关情形）与申请期限"
+  ];
+  const badgeText = result ? `上诉期限约 ${formatDate(result.deadline)}` : "待确定裁判送达日";
+  return `<section class="panel" style="margin-top:16px;">
+    <div class="panel-head"><div><h2>上诉 / 再审衔接</h2><p>一审到二审、再审的程序衔接与期限</p></div>${badge(badgeText, overdue ? "red" : "gold")}</div>
+    <div class="panel-body">
+      ${ref
+        ? `<p class="source-line">参照「${escapeHTML(ref.title)}」（${formatDate(ref.date)}）按 ${days} 日推算${result ? `，上诉期限约 ${formatDate(result.deadline)}${result.shifted ? "（已顺延至工作日）" : ""}` : ""}；实际应以裁判文书送达次日为准。</p>`
+        : `<p class="source-line">未在时间轴检索到判决/裁定节点。可用「期限推算」按送达日计算上诉期限。</p>`}
+      <div class="case-list" style="margin-top:8px;">${checklist.map(item => `<div style="display:flex; gap:10px; padding:8px 0; border-bottom:1px solid var(--line);"><span style="font-size:12px;">${escapeHTML(item)}</span></div>`).join("")}</div>
+      <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+        ${(can("edit_case") || can("manage_tasks")) ? `<button class="secondary-button" type="button" data-action="deadline-calc">期限推算</button>` : ""}
+        ${can("export_documents") ? `<button class="secondary-button" type="button" data-action="goto-appeal-doc">生成上诉状</button>` : ""}
+      </div>
+      <div class="disclaimer" style="margin-top:12px;">上诉期限须以裁判文书实际送达日为准核验；再审申请条件与期限请依据现行《民事诉讼法》逐项核对。</div>
+    </div>
+  </section>`;
+}
+
+// 渲染"执行与后续管理"页(执行进度条 + 财产线索台账 + 上诉/再审衔接)。
 function renderExecution() {
   const caseItem = currentCase();
   const clues = caseItem ? state.assetClues.filter(item => item.caseId === caseItem.id) : [];
@@ -1928,7 +1993,8 @@ function renderExecution() {
         <thead><tr><th>类型</th><th>线索描述</th><th>来源</th><th>状态</th><th>更新日期</th></tr></thead>
         <tbody>${clues.map(item => `<tr><td>${badge(item.type, "teal")}</td><td>${escapeHTML(item.description)}</td><td>${escapeHTML(item.source)}</td><td>${badge(item.status, toneForStatus(item.status))}</td><td>${formatDate(item.updatedAt)}</td></tr>`).join("") || `<tr><td colspan="5"><div class="empty-state"><strong>暂无财产线索</strong>可录入账户、不动产、车辆、股权或到期债权等信息。</div></td></tr>`}</tbody>
       </table></div>
-    </section>`;
+    </section>
+    ${renderAppealPanel(caseItem)}`;
 }
 
 // 案源 / 客户管理面板（工作区级，存于同步状态）。
@@ -2994,6 +3060,18 @@ document.addEventListener("click", async event => {
     persist();
     renderPage();
     showToast("文书已重新生成");
+  }
+  if (action === "goto-appeal-doc") {
+    if (!can("export_documents")) return showToast("当前角色无权生成文书");
+    selectedTemplate = "appeal";
+    documentDraft = generateDocument("appeal", currentCase());
+    documentReviewResults = [];
+    documentVerification = null;
+    activeRoute = "documents";
+    recordAudit("文书生成", templateLabels.appeal);
+    persist();
+    renderPage();
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
   if (action === "extract-facts") runFactExtraction();
   if (action === "strategy-tendency") runStrategyTendency();

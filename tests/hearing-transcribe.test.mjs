@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { parseTranscript, transcriptionCapabilities } from "../transcribe.mjs";
+import { parseTranscript, transcriptionCapabilities, buildAsrCommand } from "../transcribe.mjs";
 
 const dataDir = mkdtempSync(path.join(tmpdir(), "hengfa-hearing-"));
 process.env.HENGFA_DATA_DIR = dataDir;
@@ -58,6 +58,22 @@ test("parseTranscript structures SRT, labeled and plain transcripts", () => {
   assert.ok(plain[0].text.includes("争议焦点"));
 
   assert.deepEqual(parseTranscript("   "), []);
+});
+
+// ASR 命令解析:支持参数、双引号、{input} 占位与缺省追加。
+test("buildAsrCommand parses args, quotes and {input} placeholder", () => {
+  // 含 {input}:替换到位,程序与参数正确切分。
+  const a = buildAsrCommand("whisper-cli -m models/ggml.bin -l zh -nt -f {input}", "/tmp/a.mp3");
+  assert.equal(a.program, "whisper-cli");
+  assert.deepEqual(a.args, ["-m", "models/ggml.bin", "-l", "zh", "-nt", "-f", "/tmp/a.mp3"]);
+
+  // 不含 {input}:音频路径追加到末尾。
+  const b = buildAsrCommand("my-asr --wav", "/tmp/b.wav");
+  assert.deepEqual(b.args, ["--wav", "/tmp/b.wav"]);
+
+  // 双引号包裹含空格的参数。
+  const c = buildAsrCommand('asr --model "/opt/models/large v3.bin" {input}', "/tmp/c.m4a");
+  assert.deepEqual(c.args, ["--model", "/opt/models/large v3.bin", "/tmp/c.m4a"]);
 });
 
 // 无本地引擎时能力探测应回退到 manual。

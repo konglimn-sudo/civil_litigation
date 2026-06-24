@@ -3,6 +3,12 @@
 //  - 检测到本地引擎(HENGFA_ASR_CMD 自定义命令，或 python + faster-whisper)时离线转写音频；
 //  - 没有任何本地引擎时，转写不可用，回退到「手工导入/粘贴庭审笔录」（parseTranscript 结构化）。
 // 真正的 ASR 模型不内置（无法零依赖实现中文语音识别），由用户按需在本机安装。
+//
+// HENGFA_ASR_CMD 支持带参数与 {input} 占位,可适配多种本地引擎(命令须把转写文本/字幕打到 stdout)：
+//   whisper.cpp:  HENGFA_ASR_CMD="whisper-cli -m models/ggml-large-v3.bin -l zh -nt -f {input}"
+//   faster-whisper(自带 CLI): HENGFA_ASR_CMD="faster-whisper {input} --language zh"
+//   vosk/sherpa 等:           HENGFA_ASR_CMD="my-asr --wav {input}"
+// stdout 为纯文本或 SRT/VTT 均可(由 parseTranscript 自动识别);未写 {input} 时音频路径追加到末尾。
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +20,21 @@ const ASR_MODEL = process.env.HENGFA_ASR_MODEL || "small";          // faster-wh
 const AUDIO_FORMATS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".webm"]; // 受理的音频扩展名。
 
 let cachedCaps = null; // 能力探测结果缓存(探测涉及子进程,只做一次)。
+
+// 把 HENGFA_ASR_CMD 命令串解析为 { program, args }(支持双引号包裹含空格的参数);
+// 命令含 {input} 则替换为音频路径,否则把音频路径追加到参数末尾。纯函数,便于单测。
+export function buildAsrCommand(cmdString, filePath) {
+  const tokens = String(cmdString).match(/"[^"]*"|\S+/g) || []; // 简易分词:双引号整体保留,其余按空白切。
+  const cleaned = tokens.map(token => token.replace(/^"|"$/g, "")); // 去掉包裹的双引号。
+  const program = cleaned[0] || "";
+  let args = cleaned.slice(1);
+  if (args.some(arg => arg.includes("{input}"))) {
+    args = args.map(arg => arg.replaceAll("{input}", filePath)); // 占位替换。
+  } else {
+    args = [...args, filePath];                                  // 无占位则追加路径。
+  }
+  return { program, args };
+}
 
 // 探测本地语音转写能力（结果缓存）。
 export function transcriptionCapabilities() {
@@ -117,15 +138,17 @@ export function transcribeAudioLocally(filePath) {
     return { status: "manual", method: "manual", text: "", segments: [], error: "未检测到本地语音引擎" };
   }
   if (ASR_CMD) {
-    // 分支一 —— 自定义命令行引擎:约定"接受音频路径、stdout 输出文本"。
-    const result = spawnSync(ASR_CMD, [filePath], { encoding: "utf8", timeout: 1800000, maxBuffer: 64 * 1024 * 1024 });
+    // 分支一 —— 自定义命令行引擎:解析命令(支持参数与 {input}),约定 stdout 输出文本/字幕。
+    const { program, args } = buildAsrCommand(ASR_CMD, filePath);
+    const method = `command:${path.basename(program) || "asr"}`; // 方法标识带上引擎程序名。
+    const result = spawnSync(program, args, { encoding: "utf8", timeout: 1800000, maxBuffer: 64 * 1024 * 1024 });
     if (result.status !== 0) {
       // 进程非 0 退出视为失败,截断 stderr 作为错误信息。
-      return { status: "error", method: "command", text: "", segments: [], error: (result.stderr || "转写命令执行失败").slice(0, 300) };
+      return { status: "error", method, text: "", segments: [], error: (result.stderr || "转写命令执行失败").slice(0, 300) };
     }
-    const text = String(result.stdout || "").trim(); // 标准输出即转写文本。
-    if (!text) return { status: "partial", method: "command", text: "", segments: [], error: "未识别到语音内容" }; // 空结果。
-    return { status: "processed", method: "command", text, segments: parseTranscript(text), error: "" }; // 成功:把文本结构化为分段。
+    const text = String(result.stdout || "").trim(); // 标准输出即转写文本(纯文本或 SRT/VTT)。
+    if (!text) return { status: "partial", method, text: "", segments: [], error: "未识别到语音内容" }; // 空结果。
+    return { status: "processed", method, text, segments: parseTranscript(text), error: "" }; // parseTranscript 自动识别格式并分段。
   }
   // 分支二 —— Python + faster-whisper:调用 scripts/transcribe.py,期望其打印 JSON。
   const result = spawnSync(PYTHON, [path.join(moduleRoot, "scripts", "transcribe.py"), filePath], {

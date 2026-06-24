@@ -20,12 +20,12 @@
 - 基于 SQLite FTS5/BM25 的真实法律检索（CJK 双字分词），开箱内置条文级样例语料并支持导入正式法源
 - 检索增强问答：从工作区法源库召回片段，给出带可核验引用的抽取式回答
 - 起诉状、答辩状、证据目录、代理词、上诉状和执行申请书生成，并一键导出为 DOCX（零依赖、Word/WPS 可打开）
-- 文书占位符、主体信息、法源和未核验证据自动审查
+- 文书占位符、主体信息、法源和未核验证据自动审查，并含**错别字 / 格式校验**（常见法律文书易错词、标点中英混用、全半角数字、括号/书名号配对等）
 - 证据编号、分类、待证事实关联、核验状态与证据链矩阵
 - 争议焦点、证据缺口与风险路径分析；**类案检索 + 裁判倾向参考**（BM25 召回相似裁判要旨，启发式聚合支持/部分支持/驳回占比，仅供参考、不输出胜败概率）
 - 庭前清单、发问提纲、质证和辩论要点生成
 - **庭审语音转写**：本地离线转写庭审录音（可选 faster-whisper / 自定义引擎，数据不出本机）或手工导入笔录（SRT/VTT/「说话人：内容」/纯文本），结构化为带说话人与时间的分段，并可选生成**庭审小结**（争议焦点 / 自认 / 质证 / 待跟进，本地启发式或 Claude，强制附依据）
-- 执行进度与财产线索台账
+- 执行进度与财产线索台账；**上诉 / 再审衔接**（按时间轴判决/裁定节点推算上诉期限、衔接事项清单、一键生成上诉状）
 - 团队任务、工时和文书版本记录；**案源/客户（CRM）管理**与**案件归档及归档全文检索**（归档案件自动从办案列表与案件选择器隐藏，可按名称/案号/当事人/案由即时检索并一键复原）
 - **Word / WPS 文书助手插件**（Office.js 任务窗格）：在 Word / WPS 内登录同一工作区，生成诉讼文书插入光标处、插入带依据的法律问答、校验选中文本的法条引用与事实依据
 - 本地存储、脱敏、审计和来源要求的配置界面
@@ -69,8 +69,12 @@ pip install faster-whisper
 # 可选：export HENGFA_ASR_MODEL=small   # tiny/base/small/medium/large-v3
 # 可选：export HENGFA_ASR_LANG=zh
 
-# 方式二：自定义命令行引擎（如 whisper.cpp），约定「接受音频路径、stdout 输出文本」
-export HENGFA_ASR_CMD="/path/to/whisper-cli ..."
+# 方式二：自定义命令行引擎（whisper.cpp / vosk / sherpa-onnx 等），约定命令把转写文本或字幕打到 stdout。
+# 命令可带参数；用 {input} 表示音频路径（不写则自动追加到末尾），含空格的参数用双引号包裹。
+# stdout 为纯文本或 SRT/VTT 均可，系统会自动识别并切分说话人/时间。
+export HENGFA_ASR_CMD='whisper-cli -m models/ggml-large-v3.bin -l zh -nt -f {input}'   # whisper.cpp
+# export HENGFA_ASR_CMD='faster-whisper {input} --language zh'                          # faster-whisper CLI
+# export HENGFA_ASR_CMD='my-asr --wav {input}'                                          # vosk / sherpa 等
 ```
 
 音频与转写全过程在本机完成；用 `HENGFA_DISABLE_ASR=1` 可强制走手工导入。`/api/hearing/capabilities` 返回当前可用引擎。**庭审小结**默认本地启发式摘录；仅当启用 Claude 基座时才会把笔录文本发送到 Anthropic 生成（强制附「（依据：发言N）」，失败回退本地）。
