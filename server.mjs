@@ -15,6 +15,7 @@ import { transcriptionCapabilities, transcribeAudioLocally, parseTranscript } fr
 import { renderDocumentTemplate, templateLabels } from "./document-templates.mjs"; // 文书模板(与插件共享)。
 import { embedBatch, embedOne, embedderInfo, cosineSim, vectorToBlob, blobToVector } from "./embedding.mjs"; // 本地语义向量(混合检索)。
 import { applyDomain, domainProfileInfo } from "./legal-domain.mjs"; // 法律领域适配层(领域提示 + 术语词典)。
+import { classifyIntent, assessPrefiling, logicCheck } from "./agent.mjs"; // 意图识别 / 立案前评估 / 文书逻辑校验。
 
 const root = path.dirname(fileURLToPath(import.meta.url));     // 项目根目录(本文件所在处)。
 const host = "127.0.0.1";                                      // 仅监听本机回环,默认不对外暴露。
@@ -1109,7 +1110,21 @@ async function claudeChat({ system, user, maxTokens = 1024, timeout = 40000, hin
 async function claudeAnswer(query, results) {
   const context = results.map((item, index) => `【片段${index + 1}｜${item.title}｜${item.authority}｜${item.status}】\n${item.content}`).join("\n\n");
   const system = "你是中国民事诉讼法律检索助理。只能依据下面提供的【检索片段】作答，不得引用片段之外的法条、案例或数字，不得编造。每个结论后用「（依据：片段N）」标注来源；片段不足以回答时应明确说明并建议核验正式法源。用简洁、可操作的中文回答，并在结尾提示最终须由办案人员核验现行条文与效力状态。";
-  return claudeChat({ system, user: `问题：${query}\n\n可用检索片段：\n${context}`, maxTokens: 1024 });
+  return claudeChat({ system, user: `问题：${query}\n\n可用检索片段：\n${context}`, maxTokens: 1024, hint: query });
+}
+
+// 面向当事人的本地初步答疑：用通俗语言摘录依据，不做生成，结尾给出强提示。
+function consultExtractiveAnswer(results) {
+  if (!results.length) return "暂时没有在现行法律法规中找到与您问题直接相关的条文。建议您把情况说得更具体一些，或直接咨询您的承办律师。";
+  const cited = results.slice(0, 2).map((item, index) => `${index + 1}. ${item.content.slice(0, 200)}`).join("\n\n");
+  return `根据现行法律法规，初步说明如下（仅供参考）：\n\n${cited}\n\n建议下一步：保存好相关合同、票据、聊天记录等证据，并就您的具体情况咨询专业律师，以现行正式法源和律师意见为准。`;
+}
+
+// 可选 Claude 当事人答疑：通俗语言、仅依据片段、强提示，不输出胜诉概率或确定结论。
+async function claudeConsultAnswer(query, results) {
+  const context = results.map((item, index) => `【片段${index + 1}｜${item.title}】\n${item.content}`).join("\n\n");
+  const system = "你面向不具备法律专业背景的当事人做初步答疑。只能依据下面提供的【检索片段】作答，不得引用片段之外的内容，不得编造。要求：用通俗易懂的语言；说明一般性法律规定与常见处理方式；明确告知这只是初步参考、不是正式法律意见，具体应咨询其承办律师并以正式法源为准；不得给出胜诉概率或确定性结论。每个法律依据后用「（依据：片段N）」标注。";
+  return claudeChat({ system, user: `当事人问题：${query}\n\n可用检索片段：\n${context}`, maxTokens: 900, hint: query });
 }
 
 // —— 文书 Agent：事实抽取与引用校验（纯函数，便于单测）——
@@ -1214,12 +1229,17 @@ function verifyDocumentContent(workspaceId, content, caseItem, caseTexts, eviden
     facts.push({ claim: `当事人：${party}`, type: "当事人", status: hit ? "grounded" : "ungrounded", source: hit?.name || "", sourceKind: hit?.kind || "" });
   }
 
+  // 逻辑校验：文书内部一致性（诉请明确、称谓、依据齐备、金额、矛盾、事实支撑、落款）。
+  const logic = logicCheck(content, caseItem, (caseTexts || []).map(file => file.text));
+
   return {
     legal,
     facts,
+    logic,
     unverifiedLegal: legal.filter(item => item.status === "unverified").length,
     outdatedLegal: legal.filter(item => item.status === "outdated").length,
     ungroundedFacts: facts.filter(item => item.status === "ungrounded").length,
+    logicIssues: logic.length,
     filesScanned: caseTexts.length
   };
 }
@@ -1688,6 +1708,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, {
       answer,
       generatedBy,
+      intent: classifyIntent(query),
       citations: results.map(item => ({ chunkId: item.chunkId, title: item.title, authority: item.authority, status: item.status, sourceUrl: item.sourceUrl }))
     });
   }
@@ -1812,8 +1833,102 @@ async function handleApi(request, response, url) {
     const evidence = (state.evidence || []).filter(item => item.caseId === caseId);
     const caseTexts = caseFileTexts(auth.user.workspaceId, caseId);
     const result = verifyDocumentContent(auth.user.workspaceId, content, caseItem, caseTexts, evidence);
-    audit(auth, "文书引用校验", `${caseItem?.title || caseId} · 未核验法条 ${result.unverifiedLegal} · 缺依据事实 ${result.ungroundedFacts}`, request);
+    audit(auth, "文书引用校验", `${caseItem?.title || caseId} · 未核验法条 ${result.unverifiedLegal} · 缺依据事实 ${result.ungroundedFacts} · 逻辑提示 ${result.logicIssues}`, request);
     return sendJson(response, 200, result);
+  }
+
+  // 意图识别：把自然语言输入归类到办案能力（本地启发式，路由建议 + 候选 + 置信度）。
+  if (request.method === "POST" && url.pathname === "/api/agent/intent") {
+    if (!requireCsrf(request, response, auth)) return;
+    const body = await readJson(request);
+    const text = String(body.text || "").trim();
+    if (!text) return sendError(response, 400, "请输入内容", "TEXT_REQUIRED");
+    return sendJson(response, 200, { ...classifyIntent(text), classifiedBy: "heuristic" });
+  }
+
+  // Agent 自动流编排：意图识别 → 知识检索 → 事实分析 → 文书生成 → 引用与逻辑校验，一次返回各阶段产物。
+  if (request.method === "POST" && url.pathname === "/api/agent/run") {
+    if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "export_documents")) return;
+    const body = await readJson(request);
+    const caseId = String(body.caseId || "");
+    const template = String(body.template || "complaint");
+    if (!Object.prototype.hasOwnProperty.call(templateLabels, template)) return sendError(response, 400, "未知文书类型", "TEMPLATE_UNKNOWN");
+    if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
+    const state = workspaceState(auth.user.workspaceId);
+    const caseItem = (state.cases || []).find(item => item.id === caseId) || null;
+    if (!caseItem) return sendError(response, 404, "案件不存在", "CASE_NOT_FOUND");
+    const evidence = (state.evidence || []).filter(item => item.caseId === caseId);
+    const assetClues = (state.assetClues || []).filter(item => item.caseId === caseId);
+    const caseTexts = caseFileTexts(auth.user.workspaceId, caseId);
+    const query = String(body.query || [caseItem.cause, caseItem.title, caseItem.claims].filter(Boolean).join(" ")).trim();
+
+    // 1. 意图识别（指定文书时直接判定为文书起草）。
+    const intent = body.query ? classifyIntent(query) : { intent: "document_draft", route: "documents", label: "智能文书", confidence: 1, keywords: [templateLabels[template]] };
+    // 2. 知识检索（混合召回）。
+    const citations = hybridSearchLegal(auth.user.workspaceId, query, 5);
+    // 3. 事实分析（本地抽取 + 时间线）。
+    let facts = extractFactCandidates(caseTexts, caseItem, 12);
+    let analyzedBy = "local";
+    if (llmEnabled && caseTexts.length) {
+      try { facts = await claudeExtractFacts(caseItem, caseTexts); analyzedBy = `claude:${llmModel}`; }
+      catch (error) { console.error("agent analyze fallback:", error.message); analyzedBy = "local-fallback"; }
+    }
+    facts = facts.map(item => ({ ...item, date: item.date || parseFactDate(item.fact) }));
+    // 4. 文书生成。
+    const content = renderDocumentTemplate(template, caseItem, evidence, assetClues);
+    // 5. 引用与逻辑校验。
+    const verify = verifyDocumentContent(auth.user.workspaceId, content, caseItem, caseTexts, evidence);
+
+    audit(auth, "Agent 自动流", `${caseItem.title} · ${templateLabels[template]} · 引用${citations.length}/事实${facts.length}/逻辑提示${verify.logicIssues}`, request);
+    return sendJson(response, 200, {
+      intent,
+      stages: [
+        { name: "意图识别", detail: `${intent.label}（置信度 ${intent.confidence}）` },
+        { name: "知识检索", detail: `混合召回 ${citations.length} 个法源片段`, citations },
+        { name: "事实分析", detail: `抽取 ${facts.length} 条候选事实 · ${analyzedBy}`, facts, timeline: buildTimeline(facts) },
+        { name: "文书生成", detail: templateLabels[template], template, label: templateLabels[template], content },
+        { name: "引用与逻辑校验", detail: `未核验法条 ${verify.unverifiedLegal} · 缺依据事实 ${verify.ungroundedFacts} · 逻辑提示 ${verify.logicIssues}`, verify }
+      ],
+      analyzedBy
+    });
+  }
+
+  // 立案前评估打分：对主体/管辖/请求权/证据/时效/成本/调解等维度打分，给出立案准备度与建议。
+  if (request.method === "POST" && url.pathname === "/api/assessment/prefiling") {
+    if (!requireCsrf(request, response, auth)) return;
+    const body = await readJson(request);
+    const caseId = String(body.caseId || "");
+    if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
+    const state = workspaceState(auth.user.workspaceId);
+    const caseItem = (state.cases || []).find(item => item.id === caseId) || null;
+    if (!caseItem) return sendError(response, 404, "案件不存在", "CASE_NOT_FOUND");
+    const evidence = (state.evidence || []).filter(item => item.caseId === caseId);
+    const events = (state.caseEvents || []).filter(item => item.caseId === caseId);
+    const assessment = assessPrefiling(caseItem, evidence, events);
+    audit(auth, "立案前评估", `${caseItem.title} · 准备度 ${assessment.score}（${assessment.readiness}）`, request);
+    return sendJson(response, 200, { ...assessment, assessedBy: "heuristic" });
+  }
+
+  // 面向当事人初步答疑：以现行有效法源为依据、用通俗语言给出初步说明，附引用与强提示。
+  if (request.method === "POST" && url.pathname === "/api/consult/answer") {
+    if (!requireCsrf(request, response, auth)) return;
+    const body = await readJson(request);
+    const query = String(body.query || "").trim();
+    if (!query) return sendError(response, 400, "请输入您的问题", "QUERY_REQUIRED");
+    const results = hybridSearchLegal(auth.user.workspaceId, query, 4);
+    const intent = classifyIntent(query);
+    let answer = consultExtractiveAnswer(results);
+    let generatedBy = "extractive";
+    if (llmEnabled && results.length) {
+      try { answer = await claudeConsultAnswer(query, results); generatedBy = `claude:${llmModel}`; }
+      catch (error) { console.error("consult answer fallback:", error.message); generatedBy = "extractive-fallback"; }
+    }
+    audit(auth, "当事人答疑", `${query.slice(0, 120)} · ${results.length} 引用 · ${generatedBy}`, request);
+    return sendJson(response, 200, {
+      answer, generatedBy, intent,
+      disclaimer: "本回答为基于法律法规的初步说明，不构成正式法律意见；个案处理请以您的承办律师意见和正式法源为准。",
+      citations: results.map(item => ({ chunkId: item.chunkId, title: item.title, authority: item.authority, status: item.status, sourceUrl: item.sourceUrl }))
+    });
   }
 
   // 节假日表(用于期限顺延):集中维护，全员共享。
