@@ -15,7 +15,7 @@ const routeMeta = {
   qa: ["法律智能问答", "回答基于当前样例知识库，并附可核验的依据来源。"],
   hearing: ["庭审辅助", "生成庭前核对清单、发问提纲、质证意见和辩论要点。"],
   execution: ["执行与后续管理", "跟踪执行节点，维护财产线索，并衔接上诉与再审。"],
-  collaboration: ["协作与办公支撑", "集中管理团队任务、工时、文书版本与办案动态。"],
+  collaboration: ["协作与办公支撑", "集中管理团队任务、工时计费、文书版本与办案动态。"],
   platform: ["平台与安全", "查看技术分层、AI Agent 流程和本地安全配置。"]
 };
 
@@ -194,6 +194,13 @@ function createInitialState() {
       { id: "time-1", caseId: "case-1", member: "谢律师", hours: 2.5, date: dateFromNow(-1), activity: "证据审查" },
       { id: "time-2", caseId: "case-3", member: "王律师", hours: 1.5, date: dateFromNow(-2), activity: "客户访谈" }
     ],
+    feeArrangements: [
+      { caseId: "case-1", mode: "计时", hourlyRate: 800, fixedFee: 0, contingencyBase: 0, contingencyPct: 0, note: "按小时计费，月度结算", updatedAt: dateFromNow(-30) }
+    ],
+    billingEntries: [
+      { id: "bill-1", caseId: "case-1", kind: "expense", label: "诉讼费", amount: 6800, date: dateFromNow(-20), member: "谢律师" },
+      { id: "bill-2", caseId: "case-1", kind: "payment", label: "预收代理费", amount: 5000, date: dateFromNow(-25), member: "财务" }
+    ],
     assetClues: [
       { id: "clue-1", caseId: "case-2", type: "股权", description: "被执行人持有某商贸公司股权", source: "公开企业信息", status: "待核验", updatedAt: dateFromNow(-2) },
       { id: "clue-2", caseId: "case-2", type: "到期债权", description: "疑似对合作方享有应收账款", source: "客户提供合同", status: "待申请调查", updatedAt: dateFromNow(-1) }
@@ -273,6 +280,7 @@ let hearingTranscript = null;
 let hearingSummary = null;
 let legalSources = [];
 let legalRagResults = null;
+let legalRetrieval = "";          // 当前检索方式标识(如 hybrid-fts5+vector(local-concept-v1))。
 let legalIncludeLapsed = false;
 let citationImpacts = [];
 let strategyTendency = null;
@@ -583,6 +591,7 @@ async function runLegalSearch() {
   try {
     const data = await apiRequest("/api/legal/search", { method: "POST", body: { query: legalQuery, limit: 8, includeLapsed: legalIncludeLapsed } });
     legalRagResults = data.results || [];
+    legalRetrieval = data.retrieval || "";
     setSyncState("已同步");
   } catch (error) {
     legalRagResults = [];
@@ -843,6 +852,33 @@ function daysUntil(value) {
 // 金额格式化(人民币)。
 function money(value) {
   return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 }).format(Number(value || 0));
+}
+
+const FEE_MODES = ["计时", "固定", "风险代理", "混合"]; // 计费方式。
+
+// 取某案件的计费方案(无则返回计时制默认)。
+function feeArrangementFor(caseId) {
+  return (state.feeArrangements || []).find(item => item.caseId === caseId)
+    || { caseId, mode: "计时", hourlyRate: 0, fixedFee: 0, contingencyBase: 0, contingencyPct: 0, note: "", updatedAt: "" };
+}
+
+// 计费结算:依方案把工时×费率 / 固定费 / 风险代理(标的×比例)汇总为律师费,
+// 再加代垫支出得应收合计,减去已收款得应收余额。纯本地计算,数据不出本机。
+function computeBilling(caseId) {
+  const arrangement = feeArrangementFor(caseId);
+  const timed = arrangement.mode === "计时" || arrangement.mode === "混合";
+  const fixed = arrangement.mode === "固定" || arrangement.mode === "混合";
+  const contingent = arrangement.mode === "风险代理" || arrangement.mode === "混合";
+  const hours = (state.timeLogs || []).filter(item => item.caseId === caseId).reduce((sum, item) => sum + Number(item.hours || 0), 0);
+  const entries = (state.billingEntries || []).filter(item => item.caseId === caseId);
+  const timeFee = timed ? hours * Number(arrangement.hourlyRate || 0) : 0;
+  const fixedFee = fixed ? Number(arrangement.fixedFee || 0) : 0;
+  const contingencyFee = contingent ? Number(arrangement.contingencyBase || 0) * Number(arrangement.contingencyPct || 0) / 100 : 0;
+  const expenses = entries.filter(item => item.kind === "expense").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const paid = entries.filter(item => item.kind === "payment").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const feeSubtotal = timeFee + fixedFee + contingencyFee;
+  const billableTotal = feeSubtotal + expenses;
+  return { arrangement, hours, timeFee, fixedFee, contingencyFee, feeSubtotal, expenses, paid, billableTotal, outstanding: billableTotal - paid, entries, timed, fixed, contingent };
 }
 
 // 字节数 → 可读大小(KB/MB)。
@@ -1394,6 +1430,7 @@ function renderSearch() {
       <div class="toolbar">
         <input id="legal-search-input" type="search" value="${escapeHTML(legalQuery)}" placeholder="输入争议焦点、法条主题或实务问题" aria-label="检索关键词" />
         ${apiMode ? badge(`${legalSources.length} 个正式法源`, legalSources.length ? "green" : "gold") : `<select id="legal-level-filter" aria-label="效力层级">${levels.map(level => `<option ${level === legalLevel ? "selected" : ""}>${escapeHTML(level)}</option>`).join("")}</select>`}
+        ${isRag && legalRagResults && legalRagResults.length && legalRetrieval.startsWith("hybrid") ? badge("混合检索 · FTS5 + 语义向量", "teal") : ""}
         ${apiMode ? `<label class="search-toggle"><input type="checkbox" id="legal-include-lapsed" ${legalIncludeLapsed ? "checked" : ""}>显示已失效法源</label>` : ""}
         <button class="primary-button" type="button" data-action="run-search">检索</button>
       </div>
@@ -1404,7 +1441,12 @@ function renderSearch() {
             <h3>${escapeHTML(item.title)}</h3>
             <p>${escapeHTML(item.content)}</p>
             <div class="source-line">${escapeHTML(item.authority)} · 引用片段 ${escapeHTML(item.chunkId)}${safeExternalUrl(item.sourceUrl) ? ` · <a href="${safeExternalUrl(item.sourceUrl)}" target="_blank" rel="noopener">正式来源</a>` : ""}</div>
-            <div class="search-meta">${badge(item.level, "blue")}${badge(item.status, item.status.includes("有效") ? "green" : "gold")}${badge(`相关度 ${item.score}`, "teal")}</div>
+            <div class="search-meta">${badge(item.level, "blue")}${badge(item.status, item.status.includes("有效") ? "green" : "gold")}${
+              "vectorScore" in item
+                ? (item.vectorScore != null && item.lexScore != null ? badge("字面+语义", "green")
+                  : item.vectorScore != null ? badge("语义召回", "teal") : badge("字面匹配", "gold"))
+                : badge(`相关度 ${item.score}`, "teal")
+            }</div>
           </article>` : `<article class="search-card">
             <h3>${escapeHTML(item.title)}</h3><p>${escapeHTML(item.summary)}</p>
             <div class="source-line">${escapeHTML(item.source)} · 更新 ${escapeHTML(item.updatedAt)}</div>
@@ -2050,6 +2092,7 @@ function renderCollaboration() {
     can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-time">登记工时</button>` : "",
     can("manage_tasks") ? `<button class="primary-button" type="button" data-action="add-task">＋ 新建任务</button>` : ""
   ].join("");
+  const billing = caseItem ? computeBilling(caseItem.id) : null;
   return `
     ${pageHead(actions)}
     <div class="dashboard-grid">
@@ -2071,8 +2114,48 @@ function renderCollaboration() {
         </section>
       </div>
     </div>
+    ${billing ? renderBillingPanel(caseItem, billing) : ""}
     ${renderClientsPanel()}
     ${renderArchivePanel()}`;
+}
+
+// 费用与计费面板：计费方案 + 工时费/固定费/风险代理费/支出/收款结算，可导出结算单。
+function renderBillingPanel(caseItem, billing) {
+  const a = billing.arrangement;
+  const modeDetail = a.mode === "计时" || a.mode === "混合" ? `费率 ${money(a.hourlyRate)}/小时` : "";
+  const contingentDetail = (a.mode === "风险代理" || a.mode === "混合") && a.contingencyPct ? `风险比例 ${a.contingencyPct}%（标的 ${money(a.contingencyBase)}）` : "";
+  const fixedDetail = (a.mode === "固定" || a.mode === "混合") && a.fixedFee ? `固定费 ${money(a.fixedFee)}` : "";
+  const detail = [modeDetail, fixedDetail, contingentDetail].filter(Boolean).join(" · ") || "尚未设置费率";
+  const row = (label, value, strong = false) => `<div style="display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--line);"><span class="case-meta"${strong ? ' style="font-weight:600;"' : ""}>${label}</span><strong${billing.outstanding > 0 && strong ? ' style="color:var(--danger,#c0392b);"' : ""}>${value}</strong></div>`;
+  const entryActions = [
+    can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-expense">登记支出</button>` : "",
+    can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-payment">登记收款</button>` : "",
+    can("edit_case") ? `<button class="secondary-button" type="button" data-action="set-fee">设置计费方案</button>` : "",
+    can("export_documents") ? `<button class="primary-button" type="button" data-action="export-billing">导出费用结算单</button>` : ""
+  ].filter(Boolean).join("");
+  return `
+    <section class="panel" style="margin-top:16px;">
+      <div class="panel-head"><div><h2>费用与计费</h2><p>${escapeHTML(a.mode)} · ${escapeHTML(detail)}</p></div><div class="table-actions">${entryActions}</div></div>
+      <div class="panel-body">
+        <div class="dashboard-grid">
+          <div>
+            ${billing.timed ? row(`工时费（${billing.hours.toFixed(1)}h × ${money(a.hourlyRate)}）`, money(billing.timeFee)) : ""}
+            ${billing.fixed ? row("固定费", money(billing.fixedFee)) : ""}
+            ${billing.contingent ? row(`风险代理费（${a.contingencyPct || 0}%）`, money(billing.contingencyFee)) : ""}
+            ${row("律师费小计", money(billing.feeSubtotal))}
+            ${row("代垫支出合计", money(billing.expenses))}
+            ${row("应收合计", money(billing.billableTotal), true)}
+            ${row("已收款", money(billing.paid))}
+            ${row("应收余额", money(billing.outstanding), true)}
+          </div>
+          <div>
+            <div class="case-meta" style="margin-bottom:6px;"><strong>支出与收款明细</strong></div>
+            ${billing.entries.length ? billing.entries.slice().sort((x, y) => (y.date || "").localeCompare(x.date || "")).map(item => `<div style="display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--line);"><div class="case-meta"><strong>${badge(item.kind === "payment" ? "收款" : "支出", item.kind === "payment" ? "green" : "gold")} ${escapeHTML(item.label)}</strong><span>${escapeHTML(item.member || "")}${item.member ? " · " : ""}${formatDate(item.date)}</span></div><div style="display:flex; align-items:center; gap:8px;"><strong>${item.kind === "payment" ? "−" : "+"}${money(item.amount)}</strong>${can("manage_tasks") ? `<button class="quiet-button" type="button" data-action="delete-billing-entry" data-id="${item.id}">删除</button>` : ""}</div></div>`).join("") : `<div class="empty-state"><strong>暂无支出/收款</strong>登记诉讼费、差旅等支出与客户回款。</div>`}
+          </div>
+        </div>
+        <div class="disclaimer" style="margin-top:10px;">费用结算为本地测算，仅供内部参考；最终以委托代理合同与正式账单为准。</div>
+      </div>
+    </section>`;
 }
 
 // 渲染"平台与安全"页(五层架构图 + Agent 流程 + 安全设置 + 成员/节假日/webhook 维护)。
@@ -2080,8 +2163,8 @@ function renderPlatform() {
   const layers = [
     ["01", "用户交互层", "Web 工作台、桌面端、移动端、Word/WPS 插件与对话入口", "Web + Word/WPS 插件"],
     ["02", "应用服务层", "案件、文书、权限协作、工时计费与业务 API", "本地服务模拟"],
-    ["03", "AI 能力中台", "法律模型、RAG 检索、Agent 编排、意图识别与结果校验", "Claude 基座可选接入"],
-    ["04", "知识与数据层", "法条、司法解释、案例、案件档案与向量索引", "样例知识库"],
+    ["03", "AI 能力中台", "基座模型 + 法律领域适配（领域提示 + 术语词典）、混合 RAG 检索、Agent 编排、意图识别与结果校验", "Claude 基座 + 领域适配"],
+    ["04", "知识与数据层", "法条、司法解释、案例、案件档案与本地向量索引（FTS5 + 语义向量混合检索）", "样例语料 + 本地向量"],
     ["05", "基础设施层", "身份认证、存储、日志审计、加密与私有化部署", "本地存储"],
   ];
   const platformActions = [
@@ -2358,6 +2441,37 @@ function timeForm() {
       <div class="form-field"><label>日期</label><input name="date" type="date" required value="${dateFromNow(0)}"></div>
       <div class="form-field"><label>工作事项</label><input name="activity" required placeholder="例如：证据审查"></div>
     </div>`, "time-form");
+}
+
+// 设置计费方案表单(计时费率 / 固定费 / 风险代理比例)。
+function feeForm() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  const a = feeArrangementFor(caseItem.id);
+  openDialog("设置计费方案", `
+    <div class="form-grid">
+      <div class="form-field"><label>计费方式</label><select name="mode">${FEE_MODES.map(mode => `<option ${mode === a.mode ? "selected" : ""}>${mode}</option>`).join("")}</select></div>
+      <div class="form-field"><label>小时费率（元/h）</label><input name="hourlyRate" type="number" min="0" step="50" value="${escapeHTML(a.hourlyRate || "")}"></div>
+      <div class="form-field"><label>固定费（元）</label><input name="fixedFee" type="number" min="0" step="100" value="${escapeHTML(a.fixedFee || "")}"></div>
+      <div class="form-field"><label>风险代理基数（标的额，元）</label><input name="contingencyBase" type="number" min="0" step="1000" value="${escapeHTML(a.contingencyBase || caseItem.amount || "")}"></div>
+      <div class="form-field"><label>风险代理比例（%）</label><input name="contingencyPct" type="number" min="0" max="100" step="0.5" value="${escapeHTML(a.contingencyPct || "")}"></div>
+      <div class="form-field full"><label>备注</label><input name="note" value="${escapeHTML(a.note || "")}" placeholder="如：月度结算 / 胜诉后支付"></div>
+    </div>
+    <p class="disclaimer">计时与固定可与风险代理组合，请选「混合」。风险代理费 = 标的额 × 比例。</p>`, "fee-form");
+}
+
+// 登记支出 / 收款表单(kind 经隐藏域携带)。
+function billingEntryForm(kind) {
+  if (!currentCase()) return showToast("请先选择案件");
+  const isPayment = kind === "payment";
+  openDialog(isPayment ? "登记收款" : "登记支出", `
+    <input type="hidden" name="kind" value="${escapeHTML(kind)}">
+    <div class="form-grid">
+      <div class="form-field"><label>${isPayment ? "款项名称" : "支出名称"}</label><input name="label" required placeholder="${isPayment ? "如：预收代理费 / 第一期款" : "如：诉讼费 / 差旅费 / 鉴定费"}"></div>
+      <div class="form-field"><label>金额（元）</label><input name="amount" type="number" min="0" step="0.01" required></div>
+      <div class="form-field"><label>日期</label><input name="date" type="date" required value="${dateFromNow(0)}"></div>
+      <div class="form-field"><label>经办人</label><input name="member" value="${isPayment ? "财务" : "谢律师"}"></div>
+    </div>`, "billing-entry-form");
 }
 
 function clientForm(client = {}) {
@@ -2676,6 +2790,76 @@ function saveTime(form) {
   showToast("工时已登记");
 }
 
+// 保存计费方案(按案件 upsert)。
+function saveFeeArrangement(form) {
+  const data = formDataObject(form);
+  const caseId = state.activeCaseId;
+  if (!Array.isArray(state.feeArrangements)) state.feeArrangements = [];
+  const arrangement = {
+    caseId, mode: data.mode || "计时",
+    hourlyRate: Number(data.hourlyRate || 0), fixedFee: Number(data.fixedFee || 0),
+    contingencyBase: Number(data.contingencyBase || 0), contingencyPct: Number(data.contingencyPct || 0),
+    note: data.note || "", updatedAt: dateFromNow(0)
+  };
+  const index = state.feeArrangements.findIndex(item => item.caseId === caseId);
+  if (index >= 0) state.feeArrangements[index] = arrangement; else state.feeArrangements.push(arrangement);
+  recordAudit("计费方案设置", `${arrangement.mode}${arrangement.hourlyRate ? ` · ${money(arrangement.hourlyRate)}/h` : ""}`);
+  persist();
+  dialog.close();
+  renderPage();
+  showToast("计费方案已保存");
+}
+
+// 追加一条支出 / 收款记录(归属当前案件)。
+function saveBillingEntry(form) {
+  const data = formDataObject(form);
+  const kind = data.kind === "payment" ? "payment" : "expense";
+  if (!Array.isArray(state.billingEntries)) state.billingEntries = [];
+  state.billingEntries.push({ id: uid("bill"), caseId: state.activeCaseId, kind, label: data.label || (kind === "payment" ? "收款" : "支出"), amount: Number(data.amount || 0), date: data.date || dateFromNow(0), member: data.member || "" });
+  recordAudit(kind === "payment" ? "收款登记" : "支出登记", `${data.label} · ${money(data.amount)}`);
+  persist();
+  dialog.close();
+  renderPage();
+  showToast(kind === "payment" ? "收款已登记" : "支出已登记");
+}
+
+// 导出费用结算单(DOCX,本地生成)。
+function exportBillingStatement() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  const b = computeBilling(caseItem.id);
+  const a = b.arrangement;
+  const lines = [
+    `委托人：${caseItem.client || "（待填写）"}`,
+    `案件：${caseItem.title || ""}`,
+    `案由：${caseItem.cause || ""}`,
+    `计费方式：${a.mode}`,
+    a.note ? `约定备注：${a.note}` : "",
+    "",
+    "一、律师费",
+    b.timed ? `　工时费：${b.hours.toFixed(1)} 小时 × ${money(a.hourlyRate)}/小时 ＝ ${money(b.timeFee)}` : "",
+    b.fixed ? `　固定费：${money(b.fixedFee)}` : "",
+    b.contingent ? `　风险代理费：标的 ${money(a.contingencyBase)} × ${a.contingencyPct || 0}% ＝ ${money(b.contingencyFee)}` : "",
+    `　律师费小计：${money(b.feeSubtotal)}`,
+    "",
+    "二、代垫支出",
+    ...b.entries.filter(item => item.kind === "expense").map(item => `　${formatDate(item.date)}　${item.label}：${money(item.amount)}`),
+    `　支出合计：${money(b.expenses)}`,
+    "",
+    "三、结算",
+    `　应收合计（律师费 ＋ 支出）：${money(b.billableTotal)}`,
+    ...b.entries.filter(item => item.kind === "payment").map(item => `　${formatDate(item.date)}　${item.label}（已收）：${money(item.amount)}`),
+    `　已收款合计：${money(b.paid)}`,
+    `　应收余额：${money(b.outstanding)}`,
+    "",
+    `制表日期：${dateFromNow(0)}`,
+    "本结算单为内部测算，最终以委托代理合同与正式账单为准。"
+  ].filter(item => item !== "");
+  downloadDocx(`费用结算单-${caseItem.client || "案件"}.docx`, "律师费用结算单", lines.join("\n"));
+  recordAudit("费用结算单导出", `${caseItem.title} · 应收 ${money(b.billableTotal)}`);
+  showToast("费用结算单已导出");
+}
+
 // 追加一条财产线索(归属当前案件)。
 function saveClue(form) {
   const data = formDataObject(form);
@@ -2829,6 +3013,11 @@ document.addEventListener("click", async event => {
     "add-clue": "manage_evidence",
     "add-task": "manage_tasks",
     "add-time": "manage_tasks",
+    "set-fee": "edit_case",
+    "add-expense": "manage_tasks",
+    "add-payment": "manage_tasks",
+    "delete-billing-entry": "manage_tasks",
+    "export-billing": "export_documents",
     "toggle-task": "manage_tasks",
     "add-client": "manage_tasks",
     "edit-client": "manage_tasks",
@@ -2922,6 +3111,16 @@ document.addEventListener("click", async event => {
   if (action === "upload-file") fileUploadForm();
   if (action === "add-task") taskForm();
   if (action === "add-time") timeForm();
+  if (action === "set-fee") feeForm();
+  if (action === "add-expense") billingEntryForm("expense");
+  if (action === "add-payment") billingEntryForm("payment");
+  if (action === "export-billing") exportBillingStatement();
+  if (action === "delete-billing-entry") {
+    state.billingEntries = (state.billingEntries || []).filter(item => item.id !== button.dataset.id);
+    persist();
+    renderPage();
+    showToast("明细已删除");
+  }
   if (action === "add-clue") clueForm();
   if (action === "add-client") clientForm();
   if (action === "edit-client") clientForm((state.clients || []).find(item => item.id === button.dataset.id));
@@ -3314,6 +3513,8 @@ document.addEventListener("submit", event => {
   if (event.target.id === "evidence-form") saveEvidence(event.target);
   if (event.target.id === "task-form") saveTask(event.target);
   if (event.target.id === "time-form") saveTime(event.target);
+  if (event.target.id === "fee-form") saveFeeArrangement(event.target);
+  if (event.target.id === "billing-entry-form") saveBillingEntry(event.target);
   if (event.target.id === "clue-form") saveClue(event.target);
   if (event.target.id === "client-form") saveClient(event.target);
 });
