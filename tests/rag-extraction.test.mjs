@@ -46,9 +46,9 @@ test("seeded legal corpus powers FTS5 retrieval and grounded answers", async () 
   // 检索命中条文级语料，相关条文应排在前列。
   const search = await request("/api/legal/search", { method: "POST", cookie, csrf, body: { query: "违约 损失赔偿 可得利益" } });
   assert.equal(search.response.status, 200);
-  assert.equal(search.data.retrieval, "sqlite-fts5-bigram");
+  assert.match(search.data.retrieval, /^hybrid-fts5\+vector\(/, "检索应为 FTS5 + 语义向量混合");
   assert.ok(search.data.results.length > 0, "应检索到法源片段");
-  assert.ok(search.data.results[0].title.includes("违约损害赔偿"), "最相关条文应为违约损害赔偿范围");
+  assert.ok(search.data.results.slice(0, 3).some(item => item.title.includes("违约损害赔偿")), "违约损害赔偿范围应在混合检索前列");
 
   // 问答返回带可核验引用。
   const answer = await request("/api/legal/answer", { method: "POST", cookie, csrf, body: { query: "诉讼时效期间多久" } });

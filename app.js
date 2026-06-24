@@ -15,7 +15,7 @@ const routeMeta = {
   qa: ["法律智能问答", "回答基于当前样例知识库，并附可核验的依据来源。"],
   hearing: ["庭审辅助", "生成庭前核对清单、发问提纲、质证意见和辩论要点。"],
   execution: ["执行与后续管理", "跟踪执行节点，维护财产线索，并衔接上诉与再审。"],
-  collaboration: ["协作与办公支撑", "集中管理团队任务、工时、文书版本与办案动态。"],
+  collaboration: ["协作与办公支撑", "集中管理团队任务、工时计费、文书版本与办案动态。"],
   platform: ["平台与安全", "查看技术分层、AI Agent 流程和本地安全配置。"]
 };
 
@@ -194,6 +194,13 @@ function createInitialState() {
       { id: "time-1", caseId: "case-1", member: "谢律师", hours: 2.5, date: dateFromNow(-1), activity: "证据审查" },
       { id: "time-2", caseId: "case-3", member: "王律师", hours: 1.5, date: dateFromNow(-2), activity: "客户访谈" }
     ],
+    feeArrangements: [
+      { caseId: "case-1", mode: "计时", hourlyRate: 800, fixedFee: 0, contingencyBase: 0, contingencyPct: 0, note: "按小时计费，月度结算", updatedAt: dateFromNow(-30) }
+    ],
+    billingEntries: [
+      { id: "bill-1", caseId: "case-1", kind: "expense", label: "诉讼费", amount: 6800, date: dateFromNow(-20), member: "谢律师" },
+      { id: "bill-2", caseId: "case-1", kind: "payment", label: "预收代理费", amount: 5000, date: dateFromNow(-25), member: "财务" }
+    ],
     assetClues: [
       { id: "clue-1", caseId: "case-2", type: "股权", description: "被执行人持有某商贸公司股权", source: "公开企业信息", status: "待核验", updatedAt: dateFromNow(-2) },
       { id: "clue-2", caseId: "case-2", type: "到期债权", description: "疑似对合作方享有应收账款", source: "客户提供合同", status: "待申请调查", updatedAt: dateFromNow(-1) }
@@ -259,6 +266,9 @@ let documentReviewResults = [];
 let documentFacts = null;
 let documentTimeline = [];
 let documentVerification = null;
+let agentRun = null;            // Agent 自动流(检索→分析→生成→校验)最近一次结果。
+let prefilingAssessment = null; // 立案前评估最近一次结果。
+let qaAudience = "lawyer";      // 问答视角:lawyer=办案视角 / client=当事人初步答疑(当事人角色锁定)。
 let pendingDeadline = null;
 let apiMode = false;
 let currentUser = null;
@@ -273,6 +283,7 @@ let hearingTranscript = null;
 let hearingSummary = null;
 let legalSources = [];
 let legalRagResults = null;
+let legalRetrieval = "";          // 当前检索方式标识(如 hybrid-fts5+vector(local-concept-v1))。
 let legalIncludeLapsed = false;
 let citationImpacts = [];
 let strategyTendency = null;
@@ -583,6 +594,7 @@ async function runLegalSearch() {
   try {
     const data = await apiRequest("/api/legal/search", { method: "POST", body: { query: legalQuery, limit: 8, includeLapsed: legalIncludeLapsed } });
     legalRagResults = data.results || [];
+    legalRetrieval = data.retrieval || "";
     setSyncState("已同步");
   } catch (error) {
     legalRagResults = [];
@@ -592,14 +604,15 @@ async function runLegalSearch() {
   renderPage();
 }
 
-// 调用服务端检索增强问答（抽取式 + 可核验引用）。
+// 调用服务端问答：办案视角走 /api/legal/answer；当事人初步答疑走 /api/consult/answer（通俗 + 强提示）。
 async function askLegalQuestion(query) {
+  const client = qaAudience === "client";
   state.qaMessages.push({ role: "user", text: query, citations: [] });
   persist();
   renderPage();
   try {
-    const data = await apiRequest("/api/legal/answer", { method: "POST", body: { query } });
-    state.qaMessages.push({ role: "assistant", text: data.answer, citations: data.citations || [], generatedBy: data.generatedBy || "extractive" });
+    const data = await apiRequest(client ? "/api/consult/answer" : "/api/legal/answer", { method: "POST", body: { query } });
+    state.qaMessages.push({ role: "assistant", text: data.answer, citations: data.citations || [], generatedBy: data.generatedBy || "extractive", intent: data.intent || null, disclaimer: data.disclaimer || "", audience: client ? "client" : "lawyer" });
   } catch (error) {
     state.qaMessages.push({ role: "assistant", text: `检索失败：${error.message}`, citations: [] });
   }
@@ -726,6 +739,45 @@ async function runDocumentVerify() {
   renderPage();
 }
 
+// Agent 自动流编排：一次性跑「意图识别→知识检索→事实分析→文书生成→引用与逻辑校验」。
+async function runAgentFlow() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  setSyncState("Agent 自动流运行中", "is-syncing");
+  try {
+    const data = await apiRequest("/api/agent/run", { method: "POST", body: { caseId: caseItem.id, template: selectedTemplate } });
+    agentRun = data;
+    const gen = data.stages.find(stage => stage.name === "文书生成");
+    const verify = data.stages.find(stage => stage.name === "引用与逻辑校验");
+    if (gen?.content) documentDraft = gen.content;          // 生成结果载入编辑器。
+    if (verify?.verify) { documentVerification = verify.verify; documentReviewResults = []; }
+    const facts = data.stages.find(stage => stage.name === "事实分析");
+    if (facts) { documentFacts = facts.facts || []; documentTimeline = facts.timeline || []; }
+    setSyncState("已同步");
+    showToast(`自动流完成：引用 ${verify?.verify?.unverifiedLegal ?? 0} 未核验 · 逻辑提示 ${verify?.verify?.logicIssues ?? 0}`);
+  } catch (error) {
+    setSyncState("自动流失败", "is-error");
+    showToast(error.message);
+  }
+  renderPage();
+}
+
+// 立案前评估打分：调用服务端对当前案件做多维度评估。
+async function runPrefilingAssessment() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  setSyncState("正在评估立案准备度", "is-syncing");
+  try {
+    prefilingAssessment = await apiRequest("/api/assessment/prefiling", { method: "POST", body: { caseId: caseItem.id } });
+    setSyncState("已同步");
+  } catch (error) {
+    prefilingAssessment = null;
+    setSyncState("评估失败", "is-error");
+    showToast(error.message);
+  }
+  renderPage();
+}
+
 // 从服务端重新拉取业务状态(冲突或多端编辑后用)。
 async function refreshRemoteState() {
   const data = await apiRequest("/api/bootstrap");
@@ -843,6 +895,33 @@ function daysUntil(value) {
 // 金额格式化(人民币)。
 function money(value) {
   return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 }).format(Number(value || 0));
+}
+
+const FEE_MODES = ["计时", "固定", "风险代理", "混合"]; // 计费方式。
+
+// 取某案件的计费方案(无则返回计时制默认)。
+function feeArrangementFor(caseId) {
+  return (state.feeArrangements || []).find(item => item.caseId === caseId)
+    || { caseId, mode: "计时", hourlyRate: 0, fixedFee: 0, contingencyBase: 0, contingencyPct: 0, note: "", updatedAt: "" };
+}
+
+// 计费结算:依方案把工时×费率 / 固定费 / 风险代理(标的×比例)汇总为律师费,
+// 再加代垫支出得应收合计,减去已收款得应收余额。纯本地计算,数据不出本机。
+function computeBilling(caseId) {
+  const arrangement = feeArrangementFor(caseId);
+  const timed = arrangement.mode === "计时" || arrangement.mode === "混合";
+  const fixed = arrangement.mode === "固定" || arrangement.mode === "混合";
+  const contingent = arrangement.mode === "风险代理" || arrangement.mode === "混合";
+  const hours = (state.timeLogs || []).filter(item => item.caseId === caseId).reduce((sum, item) => sum + Number(item.hours || 0), 0);
+  const entries = (state.billingEntries || []).filter(item => item.caseId === caseId);
+  const timeFee = timed ? hours * Number(arrangement.hourlyRate || 0) : 0;
+  const fixedFee = fixed ? Number(arrangement.fixedFee || 0) : 0;
+  const contingencyFee = contingent ? Number(arrangement.contingencyBase || 0) * Number(arrangement.contingencyPct || 0) / 100 : 0;
+  const expenses = entries.filter(item => item.kind === "expense").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const paid = entries.filter(item => item.kind === "payment").reduce((sum, item) => sum + Number(item.amount || 0), 0);
+  const feeSubtotal = timeFee + fixedFee + contingencyFee;
+  const billableTotal = feeSubtotal + expenses;
+  return { arrangement, hours, timeFee, fixedFee, contingencyFee, feeSubtotal, expenses, paid, billableTotal, outstanding: billableTotal - paid, entries, timed, fixed, contingent };
 }
 
 // 字节数 → 可读大小(KB/MB)。
@@ -1394,6 +1473,7 @@ function renderSearch() {
       <div class="toolbar">
         <input id="legal-search-input" type="search" value="${escapeHTML(legalQuery)}" placeholder="输入争议焦点、法条主题或实务问题" aria-label="检索关键词" />
         ${apiMode ? badge(`${legalSources.length} 个正式法源`, legalSources.length ? "green" : "gold") : `<select id="legal-level-filter" aria-label="效力层级">${levels.map(level => `<option ${level === legalLevel ? "selected" : ""}>${escapeHTML(level)}</option>`).join("")}</select>`}
+        ${isRag && legalRagResults && legalRagResults.length && legalRetrieval.startsWith("hybrid") ? badge("混合检索 · FTS5 + 语义向量", "teal") : ""}
         ${apiMode ? `<label class="search-toggle"><input type="checkbox" id="legal-include-lapsed" ${legalIncludeLapsed ? "checked" : ""}>显示已失效法源</label>` : ""}
         <button class="primary-button" type="button" data-action="run-search">检索</button>
       </div>
@@ -1404,7 +1484,12 @@ function renderSearch() {
             <h3>${escapeHTML(item.title)}</h3>
             <p>${escapeHTML(item.content)}</p>
             <div class="source-line">${escapeHTML(item.authority)} · 引用片段 ${escapeHTML(item.chunkId)}${safeExternalUrl(item.sourceUrl) ? ` · <a href="${safeExternalUrl(item.sourceUrl)}" target="_blank" rel="noopener">正式来源</a>` : ""}</div>
-            <div class="search-meta">${badge(item.level, "blue")}${badge(item.status, item.status.includes("有效") ? "green" : "gold")}${badge(`相关度 ${item.score}`, "teal")}</div>
+            <div class="search-meta">${badge(item.level, "blue")}${badge(item.status, item.status.includes("有效") ? "green" : "gold")}${
+              "vectorScore" in item
+                ? (item.vectorScore != null && item.lexScore != null ? badge("字面+语义", "green")
+                  : item.vectorScore != null ? badge("语义召回", "teal") : badge("字面匹配", "gold"))
+                : badge(`相关度 ${item.score}`, "teal")
+            }</div>
           </article>` : `<article class="search-card">
             <h3>${escapeHTML(item.title)}</h3><p>${escapeHTML(item.summary)}</p>
             <div class="source-line">${escapeHTML(item.source)} · 更新 ${escapeHTML(item.updatedAt)}</div>
@@ -1515,10 +1600,12 @@ function renderDocuments() {
         <div class="toolbar">
           ${badge(caseItem?.stage || "无案件", "teal")}
           <span style="flex:1; color:var(--ink-soft); font-size:11px;">${escapeHTML(caseItem?.title || "请先选择案件")}</span>
+          ${apiMode && can("export_documents") ? `<button class="secondary-button" type="button" data-action="agent-run" title="一键运行：意图识别→检索→分析→生成→校验">智能办案流</button>` : ""}
           ${apiMode && can("export_documents") ? `<button class="secondary-button" type="button" data-action="extract-facts" title="从案件材料抽取事实">事实抽取</button>` : ""}
           <button class="secondary-button" type="button" data-action="review-document">${apiMode ? "引用校验" : "审查校对"}</button>
           ${can("export_documents") ? `<button class="secondary-button" type="button" data-action="save-version" title="保存当前草稿为版本快照">保存版本</button><button class="secondary-button" type="button" data-action="compare-versions" title="与历史版本逐行对比">版本对比</button><button class="secondary-button" type="button" data-action="copy-document" title="复制文书">复制</button><button class="primary-button" type="button" data-action="download-document" title="导出为 Word 文档">下载 DOCX</button>` : ""}
         </div>
+        ${renderAgentTracePanel()}
         ${renderFactsPanel()}
         ${documentVerification ? renderVerificationPanel() : (documentReviewResults.length ? `<div class="review-panel">
           <div class="review-head"><strong>审查结果</strong><span>${documentReviewResults.filter(item => item.level !== "pass").length} 项需关注</span></div>
@@ -1527,6 +1614,17 @@ function renderDocuments() {
         <textarea id="document-editor" class="document-editor" aria-label="文书编辑区">${escapeHTML(documentDraft)}</textarea>
       </section>
     </div>`;
+}
+
+// 渲染 Agent 自动流执行轨迹(意图→检索→分析→生成→校验,各阶段产物概览)。
+function renderAgentTracePanel() {
+  if (!agentRun) return "";
+  const i = agentRun.intent || {};
+  return `<div class="agent-panel">
+    <div class="agent-head"><strong>Agent 自动流轨迹</strong><span>意图：${escapeHTML(i.label || "")}（置信度 ${i.confidence ?? "-"}） · 已将生成结果载入下方编辑器与校验面板</span></div>
+    <div class="workflow">${(agentRun.stages || []).map((stage, index) => `<div class="workflow-step"><strong>${index + 1}. ${escapeHTML(stage.name)}</strong><span>${escapeHTML(stage.detail || "")}</span></div>`).join("")}</div>
+    <div class="disclaimer" style="margin-top:10px;">自动流串接现有检索/分析/生成/校验能力，生成初稿与提示均需人工核验后使用。</div>
+  </div>`;
 }
 
 // 渲染事实抽取面板(候选事实 + 时间线 + 一键插入/写入时间轴)。
@@ -1564,11 +1662,13 @@ function renderVerificationPanel() {
     const btn = item.status === "verified" ? "" : `<button class="quiet-button" type="button" data-action="search-legal-ref" data-ref="${escapeHTML(item.ref)}">去法律检索</button>`;
     return `<div class="review-item ${tone}"><span>${sign}</span><div><strong>法条引用：${escapeHTML(item.ref)}</strong><p>${msg}</p>${btn}</div></div>`;
   };
+  const logicSign = level => level === "high" ? "高" : level === "medium" ? "中" : "低";
   return `<div class="review-panel">
-    <div class="review-head"><strong>引用与事实校验</strong><span>未核验法条 ${v.unverifiedLegal} · 失效引用 ${v.outdatedLegal || 0} · 缺依据事实 ${v.ungroundedFacts} · 扫描材料 ${v.filesScanned} 份</span></div>
+    <div class="review-head"><strong>引用 / 事实 / 逻辑校验</strong><span>未核验法条 ${v.unverifiedLegal} · 失效引用 ${v.outdatedLegal || 0} · 缺依据事实 ${v.ungroundedFacts} · 逻辑提示 ${v.logicIssues || 0} · 扫描材料 ${v.filesScanned} 份</span></div>
     <div class="review-list">
       ${v.legal.length ? v.legal.map(legalItem).join("") : `<div class="review-item medium"><span>!</span><div><strong>未识别到法条引用</strong><p>建议补充经正式法源核验的法律依据。</p></div></div>`}
       ${v.facts.map(item => `<div class="review-item ${item.status === "grounded" ? "pass" : "medium"}"><span>${item.status === "grounded" ? "✓" : "!"}</span><div><strong>${escapeHTML(item.claim)}</strong><p>${item.status === "grounded" ? `在${item.sourceKind === "evidence" ? "证据" : "材料"}${item.source ? `《${escapeHTML(item.source)}》` : ""}中找到对应记载。` : (v.filesScanned ? "未在已上传案件材料中找到对应记载，请核验或补充。" : "尚未上传案件材料，无法核对事实依据。")}</p>${item.status === "ungrounded" ? `<button class="quiet-button" type="button" data-action="locate-evidence" data-claim="${escapeHTML(item.claim)}">去证据/材料</button>` : ""}</div></div>`).join("")}
+      ${(v.logic || []).length ? (v.logic || []).map(item => `<div class="review-item ${item.level}"><span>${logicSign(item.level)}</span><div><strong>逻辑：${escapeHTML(item.issue)}</strong><p>${escapeHTML(item.detail)}</p></div></div>`).join("") : `<div class="review-item pass"><span>✓</span><div><strong>逻辑校验未见明显问题</strong><p>诉请、称谓、依据、金额与落款的内部一致性未发现明显问题，仍需人工通读复核。</p></div></div>`}
     </div>
   </div>`;
 }
@@ -1817,8 +1917,9 @@ function renderStrategy() {
   const searchButton = apiMode
     ? `<button class="secondary-button" type="button" data-action="strategy-tendency">检索类案</button>`
     : `<button class="secondary-button" type="button" data-route="search">检索类案</button>`;
+  const assessButton = apiMode ? `<button class="secondary-button" type="button" data-action="prefiling-assess" title="对立案准备度做多维度评估">立案前评估</button>` : "";
   return `
-    ${pageHead(`${searchButton}<button class="primary-button" type="button" data-route="documents">生成策略文书</button>`)}
+    ${pageHead(`${assessButton}${searchButton}<button class="primary-button" type="button" data-route="documents">生成策略文书</button>`)}
     <div class="insight-grid">
       <article class="insight-card"><h3>综合风险参考</h3><div class="risk-score"><strong>${result.score}</strong><span>/ 100 · ${result.level}</span></div><div class="risk-bar"><span style="width:${result.score}%; background:${result.score >= 65 ? "var(--red)" : "var(--gold)"}"></span></div><p class="source-line" style="margin-top:12px;">由证据完整度、节点紧迫性和案件录入情况计算</p></article>
       <article class="insight-card"><h3>争议焦点</h3><ul>${result.disputes.map(item => `<li>${escapeHTML(item)}</li>`).join("")}</ul></article>
@@ -1831,7 +1932,31 @@ function renderStrategy() {
         <div class="disclaimer" style="margin-top:14px;">风险分值和路径建议仅用于辅助办案，不是胜败概率或确定性法律意见。</div>
       </div>
     </section>
+    ${renderPrefilingPanel()}
     ${renderTendencyPanel()}`;
+}
+
+// 立案前评估面板：立案准备度评分 + 各维度状态 + 补强建议。
+function renderPrefilingPanel() {
+  if (!apiMode) return "";
+  if (!prefilingAssessment) {
+    return `<section class="panel"><div class="panel-head"><div><h2>立案前评估</h2><p>主体 / 管辖 / 请求权 / 证据 / 时效 / 成本 / 调解 多维打分</p></div><button class="primary-button" type="button" data-action="prefiling-assess">开始评估</button></div><div class="panel-body"><div class="empty-state"><strong>尚未评估</strong>点击「开始评估」对当前案件的立案准备度做多维度参考评分。</div></div></section>`;
+  }
+  const a = prefilingAssessment;
+  const tone = status => status === "充分" ? "green" : status === "可考虑" ? "teal" : status === "需核验" ? "blue" : status === "风险" ? "red" : "gold";
+  const scoreColor = a.score >= 75 ? "var(--green)" : a.score >= 55 ? "var(--gold)" : "var(--red)";
+  return `<section class="panel">
+    <div class="panel-head"><div><h2>立案前评估</h2><p>${escapeHTML(a.recommendation)}</p></div><button class="secondary-button" type="button" data-action="prefiling-assess">重新评估</button></div>
+    <div class="panel-body">
+      <article class="insight-card" style="margin-bottom:14px;"><h3>立案准备度</h3><div class="risk-score"><strong>${a.score}</strong><span>/ 100 · ${escapeHTML(a.readiness)}</span></div><div class="risk-bar"><span style="width:${a.score}%; background:${scoreColor};"></span></div></article>
+      <div class="data-table-wrap"><table class="data-table">
+        <thead><tr><th>评估维度</th><th>状态</th><th>说明</th></tr></thead>
+        <tbody>${a.dimensions.map(dim => `<tr><td><strong>${escapeHTML(dim.label)}</strong></td><td>${badge(dim.status, tone(dim.status))}</td><td><span class="source-line">${escapeHTML(dim.note)}</span></td></tr>`).join("")}</tbody>
+      </table></div>
+      ${a.recommendations.length ? `<div style="margin-top:12px;"><strong style="font-size:13px;">建议补强 / 核验：</strong><ul>${a.recommendations.map(item => `<li style="font-size:12px; color:var(--muted);">${escapeHTML(item)}</li>`).join("")}</ul></div>` : ""}
+      <div class="disclaimer" style="margin-top:12px;">立案准备度为本地启发式参考评分，不构成是否应当起诉的确定性意见；诉讼时效等须人工核验。</div>
+    </div>
+  </section>`;
 }
 
 // 本地演示模式的问答(从样例知识库摘录并附引用;服务端模式走 /api/legal/answer)。
@@ -1844,19 +1969,33 @@ function answerQuestion(query) {
 }
 
 // 渲染"法律智能问答"页(对话历史 + 提问框,回答附依据来源)。
+// 支持「办案视角 / 当事人初步答疑」双入口；当事人角色锁定为初步答疑并强提示。
 function renderQA() {
+  const isClient = currentUser?.role === "client";
+  if (isClient) qaAudience = "client";
+  const client = qaAudience === "client";
+  const toggle = apiMode && !isClient
+    ? `<div class="segmented" role="group" aria-label="问答视角">
+        <button class="segment-button ${!client ? "is-active" : ""}" type="button" data-action="qa-audience" data-audience="lawyer">办案视角</button>
+        <button class="segment-button ${client ? "is-active" : ""}" type="button" data-action="qa-audience" data-audience="client">当事人初步答疑</button>
+      </div>`
+    : (isClient ? badge("当事人初步答疑", "teal") : "");
+  const banner = client
+    ? `<div class="disclaimer" style="margin-bottom:10px;">当事人初步答疑：以下为基于法律法规的通俗说明，<strong>不构成正式法律意见</strong>；具体处理请以您的承办律师意见和正式法源为准。</div>`
+    : "";
   return `
-    ${pageHead()}
+    ${pageHead(toggle)}
     <div class="qa-shell">
+      ${banner}
       <div class="qa-history">
-        ${state.qaMessages.map(message => `<div class="message ${message.role}">${escapeHTML(message.text)}${message.role === "assistant" && message.generatedBy ? `<div class="answer-source">${message.generatedBy.startsWith("claude") ? badge("Claude 生成 · 仅依据检索片段", "teal") : badge("检索摘录 · 未经模型生成", "gold")}</div>` : ""}${message.citations?.length ? `<div class="citation-list">${message.citations.map(citation => {
+        ${state.qaMessages.map(message => `<div class="message ${message.role}">${escapeHTML(message.text)}${message.role === "assistant" && message.generatedBy ? `<div class="answer-source">${message.audience === "client" ? badge("当事人初步答疑", "teal") : message.generatedBy.startsWith("claude") ? badge("Claude 生成 · 仅依据检索片段", "teal") : badge("检索摘录 · 未经模型生成", "gold")}${message.intent && message.intent.intent !== "consult" && message.intent.route ? ` ${badge(`意图：${message.intent.label}`, "blue")}<button class="quiet-button" type="button" data-route="${escapeHTML(message.intent.route)}">前往${escapeHTML(message.intent.label)}</button>` : ""}</div>` : ""}${message.disclaimer ? `<div class="answer-source"><span class="source-line">${escapeHTML(message.disclaimer)}</span></div>` : ""}${message.citations?.length ? `<div class="citation-list">${message.citations.map(citation => {
           if (typeof citation === "object") return `<span class="citation">依据：${escapeHTML(citation.title)} · ${escapeHTML(citation.authority)} · ${escapeHTML(citation.status)}${safeExternalUrl(citation.sourceUrl) ? ` · <a href="${safeExternalUrl(citation.sourceUrl)}" target="_blank" rel="noopener">正式来源</a>` : ""}</span>`;
           const item = knowledgeBase.find(entry => entry.id === citation);
           return item ? `<span class="citation">依据：${escapeHTML(item.title)} · ${escapeHTML(item.source)}</span>` : "";
         }).join("")}</div>` : ""}</div>`).join("")}
       </div>
       <div class="qa-input">
-        <textarea id="qa-question" placeholder="围绕当前案件提问，例如：电子证据应重点核验什么？" aria-label="法律问题"></textarea>
+        <textarea id="qa-question" placeholder="${client ? "用大白话描述您的情况，例如：对方欠货款不还，我能怎么办？" : "围绕当前案件提问，例如：电子证据应重点核验什么？"}" aria-label="法律问题"></textarea>
         <button class="primary-button" type="button" data-action="ask-question">发送</button>
       </div>
     </div>`;
@@ -2050,6 +2189,7 @@ function renderCollaboration() {
     can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-time">登记工时</button>` : "",
     can("manage_tasks") ? `<button class="primary-button" type="button" data-action="add-task">＋ 新建任务</button>` : ""
   ].join("");
+  const billing = caseItem ? computeBilling(caseItem.id) : null;
   return `
     ${pageHead(actions)}
     <div class="dashboard-grid">
@@ -2071,8 +2211,48 @@ function renderCollaboration() {
         </section>
       </div>
     </div>
+    ${billing ? renderBillingPanel(caseItem, billing) : ""}
     ${renderClientsPanel()}
     ${renderArchivePanel()}`;
+}
+
+// 费用与计费面板：计费方案 + 工时费/固定费/风险代理费/支出/收款结算，可导出结算单。
+function renderBillingPanel(caseItem, billing) {
+  const a = billing.arrangement;
+  const modeDetail = a.mode === "计时" || a.mode === "混合" ? `费率 ${money(a.hourlyRate)}/小时` : "";
+  const contingentDetail = (a.mode === "风险代理" || a.mode === "混合") && a.contingencyPct ? `风险比例 ${a.contingencyPct}%（标的 ${money(a.contingencyBase)}）` : "";
+  const fixedDetail = (a.mode === "固定" || a.mode === "混合") && a.fixedFee ? `固定费 ${money(a.fixedFee)}` : "";
+  const detail = [modeDetail, fixedDetail, contingentDetail].filter(Boolean).join(" · ") || "尚未设置费率";
+  const row = (label, value, strong = false) => `<div style="display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--line);"><span class="case-meta"${strong ? ' style="font-weight:600;"' : ""}>${label}</span><strong${billing.outstanding > 0 && strong ? ' style="color:var(--danger,#c0392b);"' : ""}>${value}</strong></div>`;
+  const entryActions = [
+    can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-expense">登记支出</button>` : "",
+    can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-payment">登记收款</button>` : "",
+    can("edit_case") ? `<button class="secondary-button" type="button" data-action="set-fee">设置计费方案</button>` : "",
+    can("export_documents") ? `<button class="primary-button" type="button" data-action="export-billing">导出费用结算单</button>` : ""
+  ].filter(Boolean).join("");
+  return `
+    <section class="panel" style="margin-top:16px;">
+      <div class="panel-head"><div><h2>费用与计费</h2><p>${escapeHTML(a.mode)} · ${escapeHTML(detail)}</p></div><div class="table-actions">${entryActions}</div></div>
+      <div class="panel-body">
+        <div class="dashboard-grid">
+          <div>
+            ${billing.timed ? row(`工时费（${billing.hours.toFixed(1)}h × ${money(a.hourlyRate)}）`, money(billing.timeFee)) : ""}
+            ${billing.fixed ? row("固定费", money(billing.fixedFee)) : ""}
+            ${billing.contingent ? row(`风险代理费（${a.contingencyPct || 0}%）`, money(billing.contingencyFee)) : ""}
+            ${row("律师费小计", money(billing.feeSubtotal))}
+            ${row("代垫支出合计", money(billing.expenses))}
+            ${row("应收合计", money(billing.billableTotal), true)}
+            ${row("已收款", money(billing.paid))}
+            ${row("应收余额", money(billing.outstanding), true)}
+          </div>
+          <div>
+            <div class="case-meta" style="margin-bottom:6px;"><strong>支出与收款明细</strong></div>
+            ${billing.entries.length ? billing.entries.slice().sort((x, y) => (y.date || "").localeCompare(x.date || "")).map(item => `<div style="display:flex; justify-content:space-between; gap:10px; padding:7px 0; border-bottom:1px solid var(--line);"><div class="case-meta"><strong>${badge(item.kind === "payment" ? "收款" : "支出", item.kind === "payment" ? "green" : "gold")} ${escapeHTML(item.label)}</strong><span>${escapeHTML(item.member || "")}${item.member ? " · " : ""}${formatDate(item.date)}</span></div><div style="display:flex; align-items:center; gap:8px;"><strong>${item.kind === "payment" ? "−" : "+"}${money(item.amount)}</strong>${can("manage_tasks") ? `<button class="quiet-button" type="button" data-action="delete-billing-entry" data-id="${item.id}">删除</button>` : ""}</div></div>`).join("") : `<div class="empty-state"><strong>暂无支出/收款</strong>登记诉讼费、差旅等支出与客户回款。</div>`}
+          </div>
+        </div>
+        <div class="disclaimer" style="margin-top:10px;">费用结算为本地测算，仅供内部参考；最终以委托代理合同与正式账单为准。</div>
+      </div>
+    </section>`;
 }
 
 // 渲染"平台与安全"页(五层架构图 + Agent 流程 + 安全设置 + 成员/节假日/webhook 维护)。
@@ -2080,8 +2260,8 @@ function renderPlatform() {
   const layers = [
     ["01", "用户交互层", "Web 工作台、桌面端、移动端、Word/WPS 插件与对话入口", "Web + Word/WPS 插件"],
     ["02", "应用服务层", "案件、文书、权限协作、工时计费与业务 API", "本地服务模拟"],
-    ["03", "AI 能力中台", "法律模型、RAG 检索、Agent 编排、意图识别与结果校验", "Claude 基座可选接入"],
-    ["04", "知识与数据层", "法条、司法解释、案例、案件档案与向量索引", "样例知识库"],
+    ["03", "AI 能力中台", "基座模型 + 法律领域适配（领域提示 + 术语词典）、混合 RAG 检索、Agent 编排、意图识别与结果校验", "Claude 基座 + 领域适配"],
+    ["04", "知识与数据层", "法条、司法解释、案例、案件档案与本地向量索引（FTS5 + 语义向量混合检索）", "样例语料 + 本地向量"],
     ["05", "基础设施层", "身份认证、存储、日志审计、加密与私有化部署", "本地存储"],
   ];
   const platformActions = [
@@ -2358,6 +2538,37 @@ function timeForm() {
       <div class="form-field"><label>日期</label><input name="date" type="date" required value="${dateFromNow(0)}"></div>
       <div class="form-field"><label>工作事项</label><input name="activity" required placeholder="例如：证据审查"></div>
     </div>`, "time-form");
+}
+
+// 设置计费方案表单(计时费率 / 固定费 / 风险代理比例)。
+function feeForm() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  const a = feeArrangementFor(caseItem.id);
+  openDialog("设置计费方案", `
+    <div class="form-grid">
+      <div class="form-field"><label>计费方式</label><select name="mode">${FEE_MODES.map(mode => `<option ${mode === a.mode ? "selected" : ""}>${mode}</option>`).join("")}</select></div>
+      <div class="form-field"><label>小时费率（元/h）</label><input name="hourlyRate" type="number" min="0" step="50" value="${escapeHTML(a.hourlyRate || "")}"></div>
+      <div class="form-field"><label>固定费（元）</label><input name="fixedFee" type="number" min="0" step="100" value="${escapeHTML(a.fixedFee || "")}"></div>
+      <div class="form-field"><label>风险代理基数（标的额，元）</label><input name="contingencyBase" type="number" min="0" step="1000" value="${escapeHTML(a.contingencyBase || caseItem.amount || "")}"></div>
+      <div class="form-field"><label>风险代理比例（%）</label><input name="contingencyPct" type="number" min="0" max="100" step="0.5" value="${escapeHTML(a.contingencyPct || "")}"></div>
+      <div class="form-field full"><label>备注</label><input name="note" value="${escapeHTML(a.note || "")}" placeholder="如：月度结算 / 胜诉后支付"></div>
+    </div>
+    <p class="disclaimer">计时与固定可与风险代理组合，请选「混合」。风险代理费 = 标的额 × 比例。</p>`, "fee-form");
+}
+
+// 登记支出 / 收款表单(kind 经隐藏域携带)。
+function billingEntryForm(kind) {
+  if (!currentCase()) return showToast("请先选择案件");
+  const isPayment = kind === "payment";
+  openDialog(isPayment ? "登记收款" : "登记支出", `
+    <input type="hidden" name="kind" value="${escapeHTML(kind)}">
+    <div class="form-grid">
+      <div class="form-field"><label>${isPayment ? "款项名称" : "支出名称"}</label><input name="label" required placeholder="${isPayment ? "如：预收代理费 / 第一期款" : "如：诉讼费 / 差旅费 / 鉴定费"}"></div>
+      <div class="form-field"><label>金额（元）</label><input name="amount" type="number" min="0" step="0.01" required></div>
+      <div class="form-field"><label>日期</label><input name="date" type="date" required value="${dateFromNow(0)}"></div>
+      <div class="form-field"><label>经办人</label><input name="member" value="${isPayment ? "财务" : "谢律师"}"></div>
+    </div>`, "billing-entry-form");
 }
 
 function clientForm(client = {}) {
@@ -2676,6 +2887,76 @@ function saveTime(form) {
   showToast("工时已登记");
 }
 
+// 保存计费方案(按案件 upsert)。
+function saveFeeArrangement(form) {
+  const data = formDataObject(form);
+  const caseId = state.activeCaseId;
+  if (!Array.isArray(state.feeArrangements)) state.feeArrangements = [];
+  const arrangement = {
+    caseId, mode: data.mode || "计时",
+    hourlyRate: Number(data.hourlyRate || 0), fixedFee: Number(data.fixedFee || 0),
+    contingencyBase: Number(data.contingencyBase || 0), contingencyPct: Number(data.contingencyPct || 0),
+    note: data.note || "", updatedAt: dateFromNow(0)
+  };
+  const index = state.feeArrangements.findIndex(item => item.caseId === caseId);
+  if (index >= 0) state.feeArrangements[index] = arrangement; else state.feeArrangements.push(arrangement);
+  recordAudit("计费方案设置", `${arrangement.mode}${arrangement.hourlyRate ? ` · ${money(arrangement.hourlyRate)}/h` : ""}`);
+  persist();
+  dialog.close();
+  renderPage();
+  showToast("计费方案已保存");
+}
+
+// 追加一条支出 / 收款记录(归属当前案件)。
+function saveBillingEntry(form) {
+  const data = formDataObject(form);
+  const kind = data.kind === "payment" ? "payment" : "expense";
+  if (!Array.isArray(state.billingEntries)) state.billingEntries = [];
+  state.billingEntries.push({ id: uid("bill"), caseId: state.activeCaseId, kind, label: data.label || (kind === "payment" ? "收款" : "支出"), amount: Number(data.amount || 0), date: data.date || dateFromNow(0), member: data.member || "" });
+  recordAudit(kind === "payment" ? "收款登记" : "支出登记", `${data.label} · ${money(data.amount)}`);
+  persist();
+  dialog.close();
+  renderPage();
+  showToast(kind === "payment" ? "收款已登记" : "支出已登记");
+}
+
+// 导出费用结算单(DOCX,本地生成)。
+function exportBillingStatement() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  const b = computeBilling(caseItem.id);
+  const a = b.arrangement;
+  const lines = [
+    `委托人：${caseItem.client || "（待填写）"}`,
+    `案件：${caseItem.title || ""}`,
+    `案由：${caseItem.cause || ""}`,
+    `计费方式：${a.mode}`,
+    a.note ? `约定备注：${a.note}` : "",
+    "",
+    "一、律师费",
+    b.timed ? `　工时费：${b.hours.toFixed(1)} 小时 × ${money(a.hourlyRate)}/小时 ＝ ${money(b.timeFee)}` : "",
+    b.fixed ? `　固定费：${money(b.fixedFee)}` : "",
+    b.contingent ? `　风险代理费：标的 ${money(a.contingencyBase)} × ${a.contingencyPct || 0}% ＝ ${money(b.contingencyFee)}` : "",
+    `　律师费小计：${money(b.feeSubtotal)}`,
+    "",
+    "二、代垫支出",
+    ...b.entries.filter(item => item.kind === "expense").map(item => `　${formatDate(item.date)}　${item.label}：${money(item.amount)}`),
+    `　支出合计：${money(b.expenses)}`,
+    "",
+    "三、结算",
+    `　应收合计（律师费 ＋ 支出）：${money(b.billableTotal)}`,
+    ...b.entries.filter(item => item.kind === "payment").map(item => `　${formatDate(item.date)}　${item.label}（已收）：${money(item.amount)}`),
+    `　已收款合计：${money(b.paid)}`,
+    `　应收余额：${money(b.outstanding)}`,
+    "",
+    `制表日期：${dateFromNow(0)}`,
+    "本结算单为内部测算，最终以委托代理合同与正式账单为准。"
+  ].filter(item => item !== "");
+  downloadDocx(`费用结算单-${caseItem.client || "案件"}.docx`, "律师费用结算单", lines.join("\n"));
+  recordAudit("费用结算单导出", `${caseItem.title} · 应收 ${money(b.billableTotal)}`);
+  showToast("费用结算单已导出");
+}
+
 // 追加一条财产线索(归属当前案件)。
 function saveClue(form) {
   const data = formDataObject(form);
@@ -2829,6 +3110,11 @@ document.addEventListener("click", async event => {
     "add-clue": "manage_evidence",
     "add-task": "manage_tasks",
     "add-time": "manage_tasks",
+    "set-fee": "edit_case",
+    "add-expense": "manage_tasks",
+    "add-payment": "manage_tasks",
+    "delete-billing-entry": "manage_tasks",
+    "export-billing": "export_documents",
     "toggle-task": "manage_tasks",
     "add-client": "manage_tasks",
     "edit-client": "manage_tasks",
@@ -2841,6 +3127,7 @@ document.addEventListener("click", async event => {
     "save-version": "export_documents",
     "compare-versions": "export_documents",
     "extract-facts": "export_documents",
+    "agent-run": "export_documents",
     "transcribe-audio": "export_documents",
     "import-transcript": "export_documents",
     "hearing-summary": "export_documents",
@@ -2922,6 +3209,16 @@ document.addEventListener("click", async event => {
   if (action === "upload-file") fileUploadForm();
   if (action === "add-task") taskForm();
   if (action === "add-time") timeForm();
+  if (action === "set-fee") feeForm();
+  if (action === "add-expense") billingEntryForm("expense");
+  if (action === "add-payment") billingEntryForm("payment");
+  if (action === "export-billing") exportBillingStatement();
+  if (action === "delete-billing-entry") {
+    state.billingEntries = (state.billingEntries || []).filter(item => item.id !== button.dataset.id);
+    persist();
+    renderPage();
+    showToast("明细已删除");
+  }
   if (action === "add-clue") clueForm();
   if (action === "add-client") clientForm();
   if (action === "edit-client") clientForm((state.clients || []).find(item => item.id === button.dataset.id));
@@ -2999,6 +3296,8 @@ document.addEventListener("click", async event => {
     documentFacts = null;
     documentVerification = null;
     strategyTendency = null;
+    prefilingAssessment = null;
+    agentRun = null;
     hearingTranscript = null;
     hearingSummary = null;
     persist();
@@ -3014,6 +3313,8 @@ document.addEventListener("click", async event => {
     documentFacts = null;
     documentVerification = null;
     strategyTendency = null;
+    prefilingAssessment = null;
+    agentRun = null;
     hearingTranscript = null;
     hearingSummary = null;
     persist();
@@ -3046,6 +3347,7 @@ document.addEventListener("click", async event => {
     documentDraft = generateDocument(selectedTemplate, currentCase());
     documentReviewResults = [];
     documentVerification = null;
+    agentRun = null;
     state.metrics.documentsGenerated += 1;
     recordAudit("文书生成", templateLabels[selectedTemplate]);
     persist();
@@ -3074,6 +3376,9 @@ document.addEventListener("click", async event => {
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
   if (action === "extract-facts") runFactExtraction();
+  if (action === "agent-run") runAgentFlow();
+  if (action === "prefiling-assess") runPrefilingAssessment();
+  if (action === "qa-audience") { qaAudience = button.dataset.audience === "client" ? "client" : "lawyer"; renderPage(); }
   if (action === "strategy-tendency") runStrategyTendency();
   if (action === "transcribe-audio") runTranscribe(document.querySelector("#transcribe-file")?.value || "");
   if (action === "import-transcript") runImportTranscript(document.querySelector("#transcript-import")?.value || "");
@@ -3314,6 +3619,8 @@ document.addEventListener("submit", event => {
   if (event.target.id === "evidence-form") saveEvidence(event.target);
   if (event.target.id === "task-form") saveTask(event.target);
   if (event.target.id === "time-form") saveTime(event.target);
+  if (event.target.id === "fee-form") saveFeeArrangement(event.target);
+  if (event.target.id === "billing-entry-form") saveBillingEntry(event.target);
   if (event.target.id === "clue-form") saveClue(event.target);
   if (event.target.id === "client-form") saveClient(event.target);
 });
@@ -3344,6 +3651,8 @@ document.addEventListener("change", event => {
     documentFacts = null;
     documentVerification = null;
     strategyTendency = null;
+    prefilingAssessment = null;
+    agentRun = null;
     hearingTranscript = null;
     hearingSummary = null;
     persist();
