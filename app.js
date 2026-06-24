@@ -1,7 +1,10 @@
-const STORAGE_KEY = "hengfa-civil-litigation-v1";
+// 衡法 AI 办案台前端(经典脚本,非模块):渲染 + 状态管理 + 调用服务端 REST API。
+// 两种运行态:服务端模式(登录后状态存 SQLite,经 /api 同步)与本地演示模式(状态存 localStorage)。
+const STORAGE_KEY = "hengfa-civil-litigation-v1"; // 本地演示模式的 localStorage 键。
 
-const stages = ["立案前评估", "立案", "庭前准备", "开庭", "判决/调解", "执行", "上诉/再审"];
+const stages = ["立案前评估", "立案", "庭前准备", "开庭", "判决/调解", "执行", "上诉/再审"]; // 案件阶段顺序(进度条用)。
 
+// 路由 → [页面标题, 副标题],驱动顶部标题与左侧导航。
 const routeMeta = {
   dashboard: ["办案总览", "汇总期限、案件状态、证据风险与团队待办。"],
   cases: ["案件全生命周期", "从立案前评估到执行、上诉与再审，统一管理案件节点。"],
@@ -16,6 +19,7 @@ const routeMeta = {
   platform: ["平台与安全", "查看技术分层、AI Agent 流程和本地安全配置。"]
 };
 
+// 文书类型 → 中文名(与服务端 document-templates.mjs 一致)。
 const templateLabels = {
   complaint: "民事起诉状",
   defense: "民事答辩状",
@@ -105,6 +109,7 @@ const knowledgeBase = [
   }
 ];
 
+// 返回相对今天 offset 天的 YYYY-MM-DD(负为过去),用于样例数据与默认日期。
 function dateFromNow(offset) {
   const date = new Date();
   date.setHours(12, 0, 0, 0);
@@ -112,6 +117,7 @@ function dateFromNow(offset) {
   return date.toISOString().slice(0, 10);
 }
 
+// 本地演示模式与"服务端空状态"时的初始业务数据(3 个样例案件及配套证据/任务/客户等)。
 function createInitialState() {
   return {
     activeCaseId: "case-1",
@@ -222,6 +228,7 @@ function createInitialState() {
   };
 }
 
+// 读取本地演示状态:localStorage 有效则与初始状态浅合并,否则回退初始状态。
 function loadState() {
   const fallback = createInitialState();
   try {
@@ -300,14 +307,17 @@ const profileRole = document.querySelector("#profile-role");
 const profileAvatar = document.querySelector("#profile-avatar");
 const topNewCase = document.querySelector("#top-new-case");
 
+// 权限判定:本地演示模式恒为真;服务端模式看后端下发的权限列表。
 function can(permission) {
   return !apiMode || grantedPermissions.includes(permission);
 }
 
+// 角色代码 → 中文名。
 function roleLabel(role) {
   return { admin: "系统管理员", lawyer: "承办律师", assistant: "律师助理", client: "当事人" }[role] || "本地工作区";
 }
 
+// 把服务端下发的状态与初始结构合并,确保各数组/设置字段齐全(避免渲染时缺字段报错)。
 function hydrateState(remote = {}) {
   const fallback = createInitialState();
   return {
@@ -319,12 +329,14 @@ function hydrateState(remote = {}) {
   };
 }
 
+// 更新右上角同步状态指示(文案 + 颜色:同步中/出错)。
 function setSyncState(label, tone = "") {
   syncState.classList.remove("is-syncing", "is-error");
   if (tone) syncState.classList.add(tone);
   syncState.lastChild.textContent = label;
 }
 
+// 刷新顶部身份区(姓名/角色/头像)与"新建案件"按钮可见性。
 function updateIdentity() {
   const name = currentUser?.name || "办案团队";
   profileName.textContent = name;
@@ -333,6 +345,7 @@ function updateIdentity() {
   topNewCase.hidden = !can("create_case");
 }
 
+// 与服务端的统一 fetch 封装:同源带 Cookie,写操作附 CSRF,非 2xx 抛带 status/code 的错误。
 async function apiRequest(path, options = {}) {
   const method = options.method || "GET";
   const headers = { ...(options.headers || {}) };
@@ -355,6 +368,7 @@ async function apiRequest(path, options = {}) {
   return data;
 }
 
+// 显示登录视图(隐藏主界面),可带一条错误提示。
 function showLogin(message = "") {
   appShell.hidden = true;
   authView.hidden = false;
@@ -363,6 +377,7 @@ function showLogin(message = "") {
   loginForm.querySelector('input[name="password"]').value = "";
 }
 
+// 显示主界面(隐藏登录视图)。
 function showApp() {
   authView.hidden = true;
   appShell.hidden = false;
@@ -374,6 +389,7 @@ function showApp() {
   renderPage();
 }
 
+// 拉取工作区成员列表(供「平台与安全」页管理,需 manage_users 权限)。
 async function loadWorkspaceUsers() {
   if (!apiMode || !can("manage_users")) return;
   const data = await apiRequest("/api/users");
@@ -392,6 +408,7 @@ async function loadCaseFiles() {
   hearingCapabilities = hearingCaps;
 }
 
+// 拉取法源库列表(供检索页与法源维护)。
 async function loadLegalSources() {
   if (!apiMode) return;
   const data = await apiRequest("/api/legal/sources");
@@ -399,6 +416,7 @@ async function loadLegalSources() {
 }
 
 // 拉取后台生成的提醒通知(到期预警等),更新顶栏铃铛。
+// 拉取通知中心条目与未读数,并刷新顶栏铃铛角标。
 async function loadNotifications() {
   if (!apiMode) { notifications = []; unreadCount = 0; updateNotifBadge(); return; }
   try {
@@ -412,6 +430,7 @@ async function loadNotifications() {
   updateNotifBadge();
 }
 
+// 根据未读数显示/隐藏铃铛角标。
 function updateNotifBadge() {
   const button = document.querySelector("#notifications-button");
   const count = document.querySelector("#notif-count");
@@ -421,6 +440,7 @@ function updateNotifBadge() {
   count.textContent = unreadCount > 99 ? "99+" : String(unreadCount);
 }
 
+// 由通知类型与元数据推断点击跳转目标(案件时间轴 / 法源维护等)。
 function notifTarget(item) {
   if (item.type === "legal_expiry" && item.meta?.sourceId) return { kind: "source", id: item.meta.sourceId, label: "前往法源" };
   if (["deadline_overdue", "deadline_due", "task_overdue", "task_due"].includes(item.type) && item.meta?.caseId) return { kind: "case", id: item.meta.caseId, label: "前往案件" };
@@ -428,6 +448,7 @@ function notifTarget(item) {
   return null;
 }
 
+// 渲染单条通知的 HTML(级别色标 + 标题/详情 + 已读态)。
 function notifItemHtml(item) {
   const toneFor = level => level === "high" ? "red" : level === "medium" ? "gold" : "teal";
   const target = notifTarget(item);
@@ -438,6 +459,7 @@ function notifItemHtml(item) {
   </div>`;
 }
 
+// 打开通知中心弹窗(按类型分组折叠展示)。
 function notificationsDialog() {
   const present = NOTIF_TYPE_ORDER.filter(type => notifications.some(item => item.type === type));
   const others = [...new Set(notifications.map(item => item.type))].filter(type => !NOTIF_TYPE_ORDER.includes(type));
@@ -457,6 +479,7 @@ function notificationsDialog() {
 
 let lastDigestText = "";
 
+// 拉取并展示"提醒日报"(把未读提醒汇总为可复制文本)。
 async function digestDialog() {
   let digest = { subject: "", text: "无待处理提醒。", groups: [], total: 0 };
   try {
@@ -478,6 +501,7 @@ async function digestDialog() {
   dialog.showModal();
 }
 
+// 打开"提醒偏好"弹窗(提前天数 / 静音类型 / 接收渠道)。
 async function notifPrefsDialog() {
   try {
     const data = await apiRequest("/api/notifications/prefs");
@@ -500,6 +524,7 @@ async function notifPrefsDialog() {
   dialog.showModal();
 }
 
+// 保存提醒偏好到服务端。
 async function saveNotifPrefs(form) {
   const leadDays = Number(new FormData(form).get("leadDays")) || 7;
   const checkedTypes = new Set([...form.querySelectorAll('input[name="type"]:checked')].map(input => input.value));
@@ -517,6 +542,7 @@ async function saveNotifPrefs(form) {
 }
 
 // 拉取 webhook 投递记录(管理员,用于平台页可视化)。
+// 拉取 webhook 投递留痕(管理员可视化)。
 async function loadWebhookLog() {
   if (!apiMode || !can("manage_settings")) return;
   try {
@@ -526,6 +552,7 @@ async function loadWebhookLog() {
 }
 
 // 反查已生成文书引用了哪些失效法源(用于仪表盘风险提醒)。
+// 拉取"失效法源影响面":哪些已生成文书引用了失效法源(仪表盘告警)。
 async function loadCitationImpacts() {
   if (!apiMode) { citationImpacts = []; return; }
   try {
@@ -537,6 +564,7 @@ async function loadCitationImpacts() {
 }
 
 // 从服务端拉取集中维护的节假日表,覆盖本地兜底(一处更新全员生效)。
+// 拉取节假日表(期限顺延计算用);失败回退内置数据。
 async function loadHolidays() {
   if (!apiMode) return;
   try {
@@ -698,6 +726,7 @@ async function runDocumentVerify() {
   renderPage();
 }
 
+// 从服务端重新拉取业务状态(冲突或多端编辑后用)。
 async function refreshRemoteState() {
   const data = await apiRequest("/api/bootstrap");
   state = hydrateState(data.state);
@@ -708,6 +737,7 @@ async function refreshRemoteState() {
   renderPage();
 }
 
+// 把本地状态变更推送到服务端(乐观锁;遇 409 冲突则重新拉取后提示)。
 async function flushStateSync() {
   if (!apiMode || currentUser?.role === "client" || syncInFlight) return;
   syncInFlight = true;
@@ -732,6 +762,7 @@ async function flushStateSync() {
   }
 }
 
+// 防抖排队状态同步(短时间多次变更只推一次)。
 function queueStateSync() {
   if (!apiMode || currentUser?.role === "client") return;
   syncPending = true;
@@ -739,11 +770,13 @@ function queueStateSync() {
   syncTimer = window.setTimeout(flushStateSync, 250);
 }
 
+// 持久化状态:写 localStorage;服务端模式下再排队同步到后端。
 function persist() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   queueStateSync();
 }
 
+// 记录一条审计:本地写入 state.auditLogs;服务端模式下同时上报 /api/audit。
 function recordAudit(action, detail, caseId = state.activeCaseId) {
   if (!state.settings.audit) return;
   state.auditLogs.unshift({
@@ -758,10 +791,12 @@ function recordAudit(action, detail, caseId = state.activeCaseId) {
   if (apiMode) apiRequest("/api/audit", { method: "POST", body: { action, detail, caseId } }).catch(() => {});
 }
 
+// 生成带前缀的本地唯一 id。
 function uid(prefix) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`;
 }
 
+// HTML 转义(所有插入模板的动态文本都须经此防 XSS)。
 function escapeHTML(value = "") {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -771,6 +806,7 @@ function escapeHTML(value = "") {
     .replaceAll("'", "&#039;");
 }
 
+// 仅放行 http(s) 外链(防 javascript: 等危险协议),否则返回空。
 function safeExternalUrl(value) {
   try {
     const url = new URL(String(value || ""));
@@ -780,6 +816,7 @@ function safeExternalUrl(value) {
   }
 }
 
+// 格式化为本地日期串。
 function formatDate(value) {
   if (!value) return "待确定";
   const date = new Date(`${value}T12:00:00`);
@@ -787,12 +824,14 @@ function formatDate(value) {
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit" }).format(date);
 }
 
+// 格式化为本地日期时间串。
 function formatDateTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value || "未知时间";
   return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }).format(date);
 }
 
+// 距某日期还有多少天(负为已过)。
 function daysUntil(value) {
   if (!value) return 9999;
   const target = new Date(`${value}T12:00:00`);
@@ -801,10 +840,12 @@ function daysUntil(value) {
   return Math.ceil((target - today) / 86400000);
 }
 
+// 金额格式化(人民币)。
 function money(value) {
   return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 }).format(Number(value || 0));
 }
 
+// 字节数 → 可读大小(KB/MB)。
 function formatBytes(value) {
   const bytes = Number(value || 0);
   if (bytes < 1024) return `${bytes} B`;
@@ -812,15 +853,18 @@ function formatBytes(value) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+// 当前选中的案件(找不到则回退到第一个)。
 function currentCase() {
   return state.cases.find(item => item.id === state.activeCaseId) || state.cases[0];
 }
 
+// 当前案件的证据列表。
 function currentEvidence() {
   const caseItem = currentCase();
   return caseItem ? state.evidence.filter(item => item.caseId === caseItem.id) : [];
 }
 
+// 底部短暂提示(1.8 秒后淡出)。
 function showToast(message) {
   toastElement.textContent = message;
   toastElement.classList.add("is-visible");
@@ -828,6 +872,7 @@ function showToast(message) {
   showToast.timer = window.setTimeout(() => toastElement.classList.remove("is-visible"), 1800);
 }
 
+// 页面标题区 HTML(取 routeMeta 的标题/副标题 + 可选右侧操作按钮)。
 function pageHead(extraActions = "") {
   const [title, subtitle] = routeMeta[activeRoute];
   return `
@@ -837,10 +882,12 @@ function pageHead(extraActions = "") {
     </div>`;
 }
 
+// 渲染一个带色调的小标签(badge)。
 function badge(text, tone = "") {
   return `<span class="badge ${tone}">${escapeHTML(text)}</span>`;
 }
 
+// 状态值 → 标签色调(绿/红/金/teal)。
 function toneForStatus(value) {
   if (["已核验", "已完成", "有效", "已提交"].includes(value)) return "green";
   if (["待补强", "高", "临近", "待申请调查"].includes(value)) return "red";
@@ -852,6 +899,7 @@ function renderCaseSelect() {
   caseSelect.innerHTML = state.cases.filter(item => !item.archived).map(item => `<option value="${item.id}" ${item.id === state.activeCaseId ? "selected" : ""}>${escapeHTML(item.title)}</option>`).join("");
 }
 
+// 汇总未完成且未过期的案件节点,按紧迫度排序(仪表盘"临期清单")。
 function deadlineItems() {
   const events = state.caseEvents
     .filter(item => item.status !== "已完成" && daysUntil(item.date) >= 0)
@@ -869,6 +917,7 @@ function deadlineItems() {
 }
 
 // 跨全部案件的同日庭审冲突(≥2 个案件同日庭审)。
+// 找出同一天有多个案件开庭的"庭期冲突"。
 function globalHearingConflicts() {
   const isHearing = item => /庭审|开庭/.test(`${item.type} ${item.title}`);
   const hearings = state.caseEvents.filter(item => item.status !== "已完成" && isHearing(item) && daysUntil(item.date) >= 0);
@@ -880,6 +929,7 @@ function globalHearingConflicts() {
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
+// 找出所有已逾期的案件节点(跨案)。
 function globalOverdueEvents() {
   return state.caseEvents
     .filter(item => item.status !== "已完成" && daysUntil(item.date) < 0)
@@ -887,12 +937,14 @@ function globalOverdueEvents() {
 }
 
 // 临近到期(60 天内)或已过有效期的法源,提示复核效力。
+// 找出临近"有效期至"的法源(到期提醒)。
 function expiringSources() {
   return legalSources
     .filter(item => item.validUntil && daysUntil(item.validUntil) <= 60)
     .sort((a, b) => a.validUntil.localeCompare(b.validUntil));
 }
 
+// 渲染仪表盘顶部的全局告警条(庭期冲突 / 逾期节点 / 法源到期 / 引用失效)。
 function renderGlobalAlerts() {
   const conflicts = globalHearingConflicts();
   const overdue = globalOverdueEvents();
@@ -912,6 +964,7 @@ function renderGlobalAlerts() {
 }
 
 // 在文书内容中高亮引用了失效法源的引用词与所在段落。
+// 在文书文本中高亮定位指定引用片段(用于"高亮失效引用")。
 function highlightCitations(content, refs) {
   const escapedRefs = [...new Set(refs.filter(Boolean))].map(escapeHTML);
   return String(content).replace(/\r\n?/g, "\n").split("\n").map(line => {
@@ -925,6 +978,7 @@ function highlightCitations(content, refs) {
 }
 
 // 根据失效法源的引用词与标题主题,推荐替换检索关键词。
+// 据失效法源主题自动预填替换检索关键词。
 function suggestReplacementQuery(impact) {
   const terms = new Set();
   for (const law of impact?.lapsed || []) {
@@ -935,6 +989,7 @@ function suggestReplacementQuery(impact) {
   return [...terms].join(" ");
 }
 
+// 在替换弹窗内检索现行有效法源候选。
 async function runReplacementSearch() {
   if (!replaceQuery.trim()) { replacementResults = []; renderLocateDialog(); return; }
   try {
@@ -947,6 +1002,7 @@ async function runReplacementSearch() {
   renderLocateDialog();
 }
 
+// 打开"定位/替换引用"弹窗(高亮失效引用段并提供替换检索)。
 function locateCitationDialog(docId) {
   const impact = citationImpacts.find(item => item.documentId === docId);
   const version = state.documentVersions.find(item => item.id === docId);
@@ -962,6 +1018,7 @@ function locateCitationDialog(docId) {
   if (can("export_documents") && replaceQuery.trim()) runReplacementSearch();
 }
 
+// 渲染定位/替换弹窗的内容(随检索结果刷新)。
 function renderLocateDialog() {
   if (!locateContext) return;
   const ctx = locateContext;
@@ -984,6 +1041,7 @@ function renderLocateDialog() {
     <div class="dialog-actions"><button class="primary-button" type="button" data-action="close-dialog">关闭</button></div>`;
 }
 
+// 渲染"办案总览"仪表盘(全局告警 + 临期清单 + 指标 + 快捷入口)。
 function renderDashboard() {
   const deadlines = deadlineItems();
   const urgent = deadlines.filter(item => daysUntil(item.date) <= 7).length;
@@ -1029,10 +1087,12 @@ function renderDashboard() {
     </div>`;
 }
 
+// 某案件的程序时间轴节点(按日期排序)。
 function caseEventsFor(caseId) {
   return state.caseEvents.filter(item => item.caseId === caseId).sort((a, b) => a.date.localeCompare(b.date));
 }
 
+// 渲染案件"案情概览"视图(当事人/案由/请求/事实等摘要)。
 function renderCaseOverview(caseItem) {
   const evidence = state.evidence.filter(item => item.caseId === caseItem.id);
   const tasks = state.tasks.filter(item => item.caseId === caseItem.id && !item.done);
@@ -1055,6 +1115,7 @@ function renderCaseOverview(caseItem) {
 }
 
 // 分析案件程序时间轴：逾期、临近(三日内)、同日多项待办、跨案庭审冲突。
+// 计算案件时间轴上的提醒(逾期/临近/同日多项/庭期冲突)。
 function timelineAlerts(caseItem) {
   const pending = caseEventsFor(caseItem.id).filter(item => item.status !== "已完成");
   const overdue = pending.filter(item => daysUntil(item.date) < 0);
@@ -1071,6 +1132,7 @@ function timelineAlerts(caseItem) {
   return { overdue, imminent, sameDay, crossCase };
 }
 
+// 渲染时间轴提醒条。
 function renderTimelineAlerts(caseItem) {
   const alerts = timelineAlerts(caseItem);
   const chips = [];
@@ -1083,6 +1145,7 @@ function renderTimelineAlerts(caseItem) {
   return `<div class="timeline-alerts">${chips.join("")}</div>`;
 }
 
+// 渲染案件"时间轴"视图(程序节点 + 状态)。
 function renderCaseTimeline(caseItem) {
   const events = caseEventsFor(caseItem.id);
   return `${renderTimelineAlerts(caseItem)}<div class="case-event-list">
@@ -1100,6 +1163,7 @@ function renderCaseTimeline(caseItem) {
   </div>`;
 }
 
+// 渲染案件"期限台账"视图。
 function renderCaseDeadlines(caseItem) {
   const deadlines = caseEventsFor(caseItem.id).filter(item => item.type.includes("期限") || item.type === "庭审" || item.status !== "已完成");
   return `${renderTimelineAlerts(caseItem)}<div class="data-table-wrap"><table class="data-table deadline-table">
@@ -1121,12 +1185,14 @@ const DEADLINE_TYPES = [
   { key: "appealDefense", label: "上诉状副本（二审答辩期）", days: 15, title: "二审答辩期限届满", editable: false }
 ];
 
+// ISO 日期加 N 天,返回 ISO 串。
 function addDaysISO(iso, days) {
   const date = new Date(`${iso}T12:00:00`);
   date.setDate(date.getDate() + days);
   return date.toISOString().slice(0, 10);
 }
 
+// 是否周末。
 function isWeekend(iso) {
   const day = new Date(`${iso}T12:00:00`).getDay();
   return day === 0 || day === 6;
@@ -1134,6 +1200,7 @@ function isWeekend(iso) {
 
 // 离线兜底节假日表(仅 file:// 本地演示或服务端不可用时使用)。
 // 服务端模式下由 loadHolidays() 用「平台与安全」集中维护的数据覆盖,实现一处更新全员生效。
+// 服务端不可用/本地演示模式时使用的内置节假日数据。
 const FALLBACK_HOLIDAYS = {
   "2025": {
     verified: true,
@@ -1166,6 +1233,7 @@ const FALLBACK_HOLIDAYS = {
 let holidayCalendars = FALLBACK_HOLIDAYS;
 
 // 末日是否为非工作日:法定节假日为是;调休上班的周末为否;否则按周末判断。
+// 是否非工作日:法定节假日 → 非工作;调休上班日 → 工作;否则看是否周末。
 function isNonWorkingDay(iso) {
   const table = holidayCalendars[iso.slice(0, 4)];
   if (table) {
@@ -1176,6 +1244,7 @@ function isNonWorkingDay(iso) {
 }
 
 // 期间自送达次日起算 days 日(末日 = 送达日 + days);末日遇周末或法定节假日顺延至下一工作日。
+// 按"送达次日起算、末日遇非工作日顺延"计算法定期限到期日。
 function computeStatutoryDeadline(serviceDate, days) {
   let deadline = addDaysISO(serviceDate, days);
   let shifted = false;
@@ -1184,6 +1253,7 @@ function computeStatutoryDeadline(serviceDate, days) {
   return { deadline, shifted, holidayLoaded: Boolean(table), holidayVerified: Boolean(table?.verified) };
 }
 
+// 打开"期限推算"弹窗。
 function deadlineCalculatorDialog() {
   const options = DEADLINE_TYPES.map(type => `<option value="${type.key}">${type.label}（${type.days} 日）</option>`).join("");
   dialogContent.innerHTML = `
@@ -1202,6 +1272,7 @@ function deadlineCalculatorDialog() {
   renderDeadlineResult();
 }
 
+// 实时渲染期限推算结果(随输入变化,不重渲整页以保焦点)。
 function renderDeadlineResult() {
   const container = document.querySelector("#deadline-result");
   if (!container) return;
@@ -1225,6 +1296,7 @@ const BATCH_DEADLINES = [
   { key: "evidence", label: "举证期限（可改）", title: "举证期限届满", days: 15 }
 ];
 
+// 打开"批量排期"弹窗(按受理/应诉通知一次写入多个节点)。
 function batchDeadlineDialog() {
   const rows = BATCH_DEADLINES.map(row => `<div class="batch-row">
     <label class="batch-check"><input type="checkbox" id="batch-${row.key}-on" checked> ${row.label}</label>
@@ -1244,6 +1316,7 @@ function batchDeadlineDialog() {
   renderBatchRows();
 }
 
+// 实时渲染批量排期各行的推算到期日。
 function renderBatchRows() {
   const service = document.querySelector("#batch-service-date")?.value;
   for (const row of BATCH_DEADLINES) {
@@ -1256,6 +1329,7 @@ function renderBatchRows() {
   }
 }
 
+// 渲染"案件全生命周期"页(阶段进度条 + 当前案件档案 + 全部案件列表;归档案件不在列表)。
 function renderCases() {
   const active = currentCase();
   const stageIndex = active ? stages.indexOf(active.stage) : 0;
@@ -1298,6 +1372,7 @@ function renderCases() {
     </div>`;
 }
 
+// 本地演示模式的样例知识库检索(服务端模式用 FTS5 接口)。
 function searchKnowledge(query, level) {
   const normalized = query.trim().toLowerCase();
   return knowledgeBase.filter(item => {
@@ -1307,6 +1382,7 @@ function searchKnowledge(query, level) {
   });
 }
 
+// 渲染"智能法律检索"页(服务端 FTS 结果或本地样例,显示效力/时效/出处)。
 function renderSearch() {
   const levels = ["全部", ...new Set(knowledgeBase.map(item => item.level))];
   const localResults = searchKnowledge(legalQuery, legalLevel);
@@ -1341,6 +1417,7 @@ function renderSearch() {
 }
 
 // 由证据链矩阵生成「证据缺口与补强提示」，供文书生成直接引用。
+// 由证据矩阵生成"证据链与补强提示"文本(嵌入文书初稿)。
 function evidenceGapNote(caseItem) {
   const items = state.evidence.filter(item => item.caseId === caseItem?.id);
   if (!items.length) return "\n\n【证据链提示】当前案件尚未录入证据，请补充证据材料并关联待证事实后再行提交。";
@@ -1351,6 +1428,7 @@ function evidenceGapNote(caseItem) {
   return `\n\n【证据链与补强提示（提交前处理）】\n${lines.join("\n")}`;
 }
 
+// 本地拼装文书初稿(与服务端 document-templates.mjs 对应,改一处须同步另一处)。
 function generateDocument(template, caseItem) {
   if (!caseItem) return "请先新建并选择案件。";
   const evidence = state.evidence.filter(item => item.caseId === caseItem.id);
@@ -1371,6 +1449,7 @@ function generateDocument(template, caseItem) {
   return (templates[template] || templates.complaint) + gapNote + verify;
 }
 
+// 本地文书审查:检测占位符、主体缺失、未核验证据、缺法律依据等并给出风险条目。
 function reviewDocument(content, caseItem) {
   const findings = [];
   const add = (level, title, detail) => findings.push({ level, title, detail });
@@ -1389,6 +1468,7 @@ function reviewDocument(content, caseItem) {
   return findings;
 }
 
+// 渲染"智能文书"页(模板选择 + 草稿编辑器 + 事实抽取/校验/版本对比面板)。
 function renderDocuments() {
   const caseItem = currentCase();
   if (!documentDraft) documentDraft = generateDocument(selectedTemplate, caseItem);
@@ -1419,6 +1499,7 @@ function renderDocuments() {
     </div>`;
 }
 
+// 渲染事实抽取面板(候选事实 + 时间线 + 一键插入/写入时间轴)。
 function renderFactsPanel() {
   if (!documentFacts) return "";
   if (!documentFacts.length) return `<div class="agent-panel"><div class="agent-head"><strong>事实抽取</strong><span>未从案件材料中抽取到候选事实，请先在「证据管理」页上传案件材料并完成识别。</span></div></div>`;
@@ -1438,6 +1519,7 @@ function renderFactsPanel() {
   </div>`;
 }
 
+// 渲染引用校验面板(法条/事实核验结果 + 跳转补充)。
 function renderVerificationPanel() {
   const v = documentVerification;
   if (!v) return "";
@@ -1462,6 +1544,7 @@ function renderVerificationPanel() {
 }
 
 // 行级 LCS diff：返回 {type: same|add|del, text} 序列。
+// 行级 LCS diff:对比两段文本的增删行(版本对比用)。
 function diffLines(oldText, newText) {
   const a = String(oldText).split("\n");
   const b = String(newText).split("\n");
@@ -1483,6 +1566,7 @@ function diffLines(oldText, newText) {
 }
 
 // 把当前文书内容存为一个版本快照（含内容，用于后续对比）。
+// 为当前草稿存一个版本快照(documentVersions)。
 function snapshotVersion(content) {
   const label = templateLabels[selectedTemplate];
   const previous = state.documentVersions.filter(item => item.caseId === state.activeCaseId && item.name === label).length;
@@ -1494,16 +1578,19 @@ function snapshotVersion(content) {
   return version;
 }
 
+// 取某版本(或当前草稿)的文本内容。
 function resolveVersionContent(id) {
   if (id === "__current__") return document.querySelector("#document-editor")?.value || documentDraft;
   return state.documentVersions.find(item => item.id === id)?.content || "";
 }
 
+// 版本下拉的显示文案。
 function versionLabel(id) {
   if (id === "__current__") return "当前草稿";
   return state.documentVersions.find(item => item.id === id)?.version || "版本";
 }
 
+// 渲染两个所选版本的行级差异。
 function renderVersionDiff() {
   const container = document.querySelector("#version-diff");
   if (!container) return;
@@ -1516,6 +1603,7 @@ function renderVersionDiff() {
     <div class="diff-lines">${rows.map(row => `<div class="diff-line ${row.type}"><span class="diff-sign">${row.type === "add" ? "+" : row.type === "del" ? "−" : ""}</span><span>${escapeHTML(row.text) || "&nbsp;"}</span></div>`).join("")}</div>`;
 }
 
+// 打开"版本对比"弹窗。
 function compareVersionsDialog() {
   const label = templateLabels[selectedTemplate];
   const versions = state.documentVersions.filter(item => item.caseId === state.activeCaseId && item.name === label && typeof item.content === "string");
@@ -1537,6 +1625,7 @@ function compareVersionsDialog() {
   renderVersionDiff();
 }
 
+// 由证据构建"待证事实 × 核验/强度"矩阵数据。
 function evidenceMatrix(items) {
   const groups = new Map();
   items.forEach(item => {
@@ -1556,6 +1645,7 @@ function evidenceMatrix(items) {
   });
 }
 
+// 渲染证据链矩阵表。
 function renderEvidenceMatrix(items) {
   const matrix = evidenceMatrix(items);
   return `<div class="data-table-wrap"><table class="data-table evidence-matrix">
@@ -1570,6 +1660,7 @@ function renderEvidenceMatrix(items) {
   </table></div>`;
 }
 
+// 渲染已上传案件材料列表(状态/抽取方式/操作)。
 function renderCaseFiles() {
   if (!apiMode) return "";
   const files = caseFiles.filter(item => item.caseId === state.activeCaseId);
@@ -1590,6 +1681,7 @@ function renderCaseFiles() {
   </section>`;
 }
 
+// 渲染"证据管理与分析"页(目录视图 / 证据链矩阵 + 材料上传)。
 function renderEvidence() {
   const items = currentEvidence();
   const unverified = items.filter(item => item.status !== "已核验").length;
@@ -1628,6 +1720,7 @@ function renderEvidence() {
     </section>`;
 }
 
+// 本地启发式风险参考:按证据缺口/紧迫度/录入情况算分(非胜败概率,仅辅助)。
 function calculateStrategy(caseItem, evidence) {
   const gaps = evidence.filter(item => item.status !== "已核验");
   const weak = evidence.filter(item => item.strength !== "强");
@@ -1711,6 +1804,7 @@ function renderStrategy() {
     ${renderTendencyPanel()}`;
 }
 
+// 本地演示模式的问答(从样例知识库摘录并附引用;服务端模式走 /api/legal/answer)。
 function answerQuestion(query) {
   const matches = searchKnowledge(query, "全部").slice(0, 3);
   const caseItem = currentCase();
@@ -1719,6 +1813,7 @@ function answerQuestion(query) {
   return { answer, citations: matches.map(item => item.id) };
 }
 
+// 渲染"法律智能问答"页(对话历史 + 提问框,回答附依据来源)。
 function renderQA() {
   return `
     ${pageHead()}
@@ -1737,11 +1832,13 @@ function renderQA() {
     </div>`;
 }
 
+// 基于案件与证据生成庭审辅助提纲文本(庭前核对/争议焦点/发问/质证/辩论)。
 function hearingOutline(caseItem) {
   const evidence = state.evidence.filter(item => item.caseId === caseItem.id);
   return `庭审辅助提纲\n\n案件：${caseItem.title}\n案号：${caseItem.caseNo}\n开庭时间：${caseItem.hearingDate || "待确定"}\n\n一、庭前核对\n1. 核对诉讼请求、事实理由与最新证据目录是否一致。\n2. 核对当事人身份、授权材料、原件和电子数据原始载体。\n3. 核对法院通知、举证期限及送达情况。\n\n二、争议焦点\n1. ${caseItem.cause}项下合同义务及履行情况。\n2. 违约或责任事实能否由现有证据证明。\n3. 请求金额及损失计算是否充分。\n\n三、发问提纲\n1. 请对方说明合同签订、履行和对账过程。\n2. 请对方确认关键文件、签章或电子账号主体。\n3. 请对方说明未履行或提出异议的具体时间与依据。\n\n四、质证要点\n${evidence.map((item, index) => `${index + 1}. ${item.name}：核对真实性、合法性、关联性；关注${item.note || "与待证事实的对应关系"}。`).join("\n") || "暂无证据，请先建立证据目录。"}\n\n五、辩论要点\n围绕请求权基础、证明责任、证据链完整性、损失范围和程序事项展开。\n\n【提示】本提纲仅供庭前准备，需结合庭审进展动态调整。`;
 }
 
+// 渲染"庭审辅助"页(庭前状态清单 + 智能提纲编辑器 + 语音转写面板)。
 function renderHearing() {
   const caseItem = currentCase();
   if (!caseItem) return `${pageHead()}<div class="empty-state"><strong>暂无案件</strong>请先新建案件。</div>`;
@@ -1816,6 +1913,7 @@ function renderTranscriptionPanel(caseItem) {
   </section>`;
 }
 
+// 渲染"执行与后续管理"页(执行进度条 + 财产线索台账)。
 function renderExecution() {
   const caseItem = currentCase();
   const clues = caseItem ? state.assetClues.filter(item => item.caseId === caseItem.id) : [];
@@ -1911,6 +2009,7 @@ function renderCollaboration() {
     ${renderArchivePanel()}`;
 }
 
+// 渲染"平台与安全"页(五层架构图 + Agent 流程 + 安全设置 + 成员/节假日/webhook 维护)。
 function renderPlatform() {
   const layers = [
     ["01", "用户交互层", "Web 工作台、桌面端、移动端、Word/WPS 插件与对话入口", "Web + Word/WPS 插件"],
@@ -1983,6 +2082,7 @@ function renderPlatform() {
     ${can("manage_settings") ? `<div style="margin-top:16px; text-align:right;"><button class="danger-button" type="button" data-action="reset-demo">重置演示数据</button></div>` : ""}`;
 }
 
+// 路由 → 对应页面渲染函数。
 const renderers = {
   dashboard: renderDashboard,
   cases: renderCases,
@@ -1997,6 +2097,7 @@ const renderers = {
   platform: renderPlatform
 };
 
+// 按当前路由渲染主内容区,并刷新导航高亮/案件选择器/通知角标等。
 function renderPage() {
   document.querySelectorAll("[data-route]").forEach(button => button.classList.toggle("is-active", button.dataset.route === activeRoute && button.classList.contains("nav-item")));
   view.innerHTML = (renderers[activeRoute] || renderDashboard)();
@@ -2004,6 +2105,7 @@ function renderPage() {
   if (activeRoute === "qa") requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" }));
 }
 
+// 应用启动入口:探测会话→服务端模式拉取状态/各类数据,否则进入本地演示模式,最后首渲。
 async function initializeApp() {
   // Capacitor(安卓本地演示)或非 http(file://)环境下直接进入本地演示模式,不连后端。
   if (window.Capacitor || !/^https?:$/.test(window.location.protocol)) {
@@ -2050,6 +2152,7 @@ async function initializeApp() {
   }
 }
 
+// 通用弹窗:包一层 <form id=formId>,统一标题/关闭/提交按钮,提交由全局 submit 监听分发。
 function openDialog(title, body, formId, submitLabel = "保存") {
   dialogContent.innerHTML = `
     <form id="${formId}" method="dialog">
@@ -2060,6 +2163,7 @@ function openDialog(title, body, formId, submitLabel = "保存") {
   dialog.showModal();
 }
 
+// 新建/编辑案件表单。
 function caseForm(caseItem = {}) {
   openDialog(caseItem.id ? "编辑案件" : "新建案件", `
     <input type="hidden" name="id" value="${escapeHTML(caseItem.id || "")}">
@@ -2080,6 +2184,7 @@ function caseForm(caseItem = {}) {
     </div>`, "case-form");
 }
 
+// 新增案件程序节点表单。
 function caseEventForm() {
   openDialog("新增案件节点", `
     <div class="form-grid">
@@ -2093,6 +2198,7 @@ function caseEventForm() {
     </div>`, "case-event-form");
 }
 
+// 添加证据表单。
 function evidenceForm() {
   const nextNo = currentEvidence().length + 1;
   openDialog("添加证据", `
@@ -2108,6 +2214,7 @@ function evidenceForm() {
     </div>`, "evidence-form");
 }
 
+// 上传案件材料表单。
 function fileUploadForm() {
   openDialog("上传案件材料", `
     <div class="form-grid">
@@ -2116,6 +2223,7 @@ function fileUploadForm() {
     </div>`, "file-upload-form", "上传并识别");
 }
 
+// 提交文件上传:读取所选文件,二进制 PUT 到 /api/files,刷新列表。
 async function saveFileUpload(form) {
   const files = [...form.querySelector("#case-file-input").files];
   if (!files.length) return showToast("请选择需要上传的案件材料");
@@ -2141,6 +2249,7 @@ async function saveFileUpload(form) {
   }
 }
 
+// 展示单个文件的抽取详情弹窗。
 function showFileDetail(file) {
   dialogContent.innerHTML = `
     <div class="dialog-head"><h2>${escapeHTML(file.name)}</h2><button class="dialog-close" type="button" data-action="close-dialog" aria-label="关闭">×</button></div>
@@ -2155,12 +2264,14 @@ function showFileDetail(file) {
   dialog.showModal();
 }
 
+// 下载案件文件原件(经服务端下载端点)。
 function downloadCaseFile(fileId) {
   const link = document.createElement("a");
   link.href = `/api/files/${encodeURIComponent(fileId)}/download`;
   link.click();
 }
 
+// 新建团队任务表单。
 function taskForm() {
   openDialog("新建团队任务", `
     <div class="form-grid">
@@ -2172,6 +2283,7 @@ function taskForm() {
     </div>`, "task-form");
 }
 
+// 登记工时表单。
 function timeForm() {
   openDialog("登记工时", `
     <div class="form-grid">
@@ -2194,6 +2306,7 @@ function clientForm(client = {}) {
     </div>`, "client-form");
 }
 
+// 添加财产线索表单。
 function clueForm() {
   openDialog("添加财产线索", `
     <div class="form-grid">
@@ -2204,6 +2317,7 @@ function clueForm() {
     </div>`, "clue-form");
 }
 
+// 新增/编辑成员表单(角色 + 案件授权)。
 function userForm(user = {}) {
   const selectedCases = new Set(user.caseIds || []);
   openDialog(user.id ? "编辑成员权限" : "新增工作区成员", `
@@ -2221,6 +2335,7 @@ function userForm(user = {}) {
     </div>`, "user-form", user.id ? "保存权限" : "创建成员");
 }
 
+// 修改密码表单。
 function changePasswordForm() {
   openDialog("修改登录密码", `
     <div class="form-grid">
@@ -2230,6 +2345,7 @@ function changePasswordForm() {
     </div>`, "password-form", "更新密码");
 }
 
+// 单条导入法源表单。
 function legalSourceForm() {
   openDialog("导入正式法源", `
     <div class="form-grid">
@@ -2245,6 +2361,7 @@ function legalSourceForm() {
     </div>`, "legal-source-form", "入库并建立索引");
 }
 
+// 新增/编辑某年度节假日表单。
 function holidayForm(year = "") {
   const cal = (year && holidayCalendars[year]) || { verified: false, holidays: [], workdays: [] };
   openDialog(year ? `编辑 ${year} 年节假日` : "新增年度节假日", `
@@ -2257,6 +2374,7 @@ function holidayForm(year = "") {
     </div>`, "holiday-form", "保存并下发");
 }
 
+// 提交节假日维护到服务端并刷新本地缓存。
 async function saveHoliday(form) {
   const data = formDataObject(form);
   const year = String(data.year || "").trim();
@@ -2273,10 +2391,12 @@ async function saveHoliday(form) {
   }
 }
 
+// 表单 → 普通对象(单值字段;多选另行用 getAll 处理)。
 function formDataObject(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
+// 新增或更新成员(POST/PATCH /api/users),刷新成员列表。
 async function saveUser(form) {
   const data = formDataObject(form);
   const payload = { ...data, caseIds: new FormData(form).getAll("caseIds") };
@@ -2292,6 +2412,7 @@ async function saveUser(form) {
   }
 }
 
+// 提交修改密码。
 async function savePassword(form) {
   const data = formDataObject(form);
   if (data.newPassword !== data.confirmPassword) return showToast("两次输入的新密码不一致");
@@ -2304,6 +2425,7 @@ async function savePassword(form) {
   }
 }
 
+// 提交单条法源入库。
 async function saveLegalSource(form) {
   const data = formDataObject(form);
   try {
@@ -2318,6 +2440,7 @@ async function saveLegalSource(form) {
   }
 }
 
+// 删除法源(二次确认)。
 async function deleteLegalSource(id) {
   if (!id || !window.confirm("确定从法源库删除该法源及其检索索引吗？")) return;
   try {
@@ -2331,6 +2454,7 @@ async function deleteLegalSource(id) {
   }
 }
 
+// 编辑法源元数据/效力状态表单。
 function legalSourceEditForm(source) {
   if (!source) return;
   const statuses = ["现行有效", "尚未生效", "已修改", "已废止", "待核验"];
@@ -2349,6 +2473,7 @@ function legalSourceEditForm(source) {
     </div>`, "legal-edit-form", "保存变更");
 }
 
+// 提交法源元数据变更(逐字段留痕)。
 async function saveLegalEdit(form) {
   const data = formDataObject(form);
   try {
@@ -2365,6 +2490,7 @@ async function saveLegalEdit(form) {
   }
 }
 
+// 查看某法源的变更历史弹窗。
 async function showLegalRevisions(id) {
   try {
     const data = await apiRequest(`/api/legal/sources/${encodeURIComponent(id)}/revisions`);
@@ -2382,6 +2508,7 @@ async function showLegalRevisions(id) {
 }
 
 // 批量导入法源 JSON（如 scripts/fetch_flk.mjs 抓取的官方法源结果）。
+// 批量导入法源 JSON 弹窗(上传文件 → /api/legal/import)。
 function importLegalJson() {
   const input = document.createElement("input");
   input.type = "file";
@@ -2405,6 +2532,7 @@ function importLegalJson() {
   input.click();
 }
 
+// 保存案件(新建追加/编辑更新),并设为当前案件。
 function saveCase(form) {
   const data = formDataObject(form);
   const existing = state.cases.find(item => item.id === data.id);
@@ -2438,6 +2566,7 @@ function saveCase(form) {
   showToast(existing ? "案件已更新" : "案件已创建");
 }
 
+// 追加一个案件程序节点。
 function saveCaseEvent(form) {
   const data = formDataObject(form);
   state.caseEvents.push({ id: uid("event"), caseId: state.activeCaseId, ...data });
@@ -2449,6 +2578,7 @@ function saveCaseEvent(form) {
   showToast("案件节点已保存");
 }
 
+// 追加一条证据(自动编号)。
 function saveEvidence(form) {
   const data = formDataObject(form);
   state.evidence.push({ id: uid("ev"), caseId: state.activeCaseId, ...data, status: "待核验" });
@@ -2459,6 +2589,7 @@ function saveEvidence(form) {
   showToast("证据已加入目录");
 }
 
+// 追加一个团队任务。
 function saveTask(form) {
   const data = formDataObject(form);
   state.tasks.push({ id: uid("task"), ...data, done: false });
@@ -2469,6 +2600,7 @@ function saveTask(form) {
   showToast("团队任务已创建");
 }
 
+// 追加一条工时记录(归属当前案件)。
 function saveTime(form) {
   const data = formDataObject(form);
   state.timeLogs.push({ id: uid("time"), caseId: state.activeCaseId, ...data, hours: Number(data.hours) });
@@ -2478,6 +2610,7 @@ function saveTime(form) {
   showToast("工时已登记");
 }
 
+// 追加一条财产线索(归属当前案件)。
 function saveClue(form) {
   const data = formDataObject(form);
   state.assetClues.push({ id: uid("clue"), caseId: state.activeCaseId, ...data, updatedAt: dateFromNow(0) });
@@ -2506,6 +2639,7 @@ function saveClient(form) {
   showToast("客户信息已保存");
 }
 
+// 复制文本到剪贴板(失败时用隐藏 textarea 兜底)。
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -2521,6 +2655,7 @@ async function copyText(text) {
 }
 
 // —— 零依赖客户端 DOCX 生成（ZIP/STORE + CRC32 + OOXML，Word/WPS 可直接打开）——
+// CRC32 校验(ZIP/DOCX 打包需要)。
 function crc32(bytes) {
   let crc = ~0;
   for (let i = 0; i < bytes.length; i += 1) {
@@ -2530,6 +2665,7 @@ function crc32(bytes) {
   return (~crc) >>> 0;
 }
 
+// 拼接多个字节数组。
 function concatBytes(parts) {
   let length = 0;
   for (const part of parts) length += part.length;
@@ -2539,6 +2675,7 @@ function concatBytes(parts) {
   return out;
 }
 
+// 零依赖 ZIP 打包(STORE 不压缩),用于在浏览器端直接生成 DOCX。
 function zipStore(entries) {
   const encoder = new TextEncoder();
   const u16 = n => new Uint8Array([n & 255, (n >>> 8) & 255]);
@@ -2562,10 +2699,12 @@ function zipStore(entries) {
   return concatBytes([...locals, ...central, end]);
 }
 
+// XML 转义(写入 DOCX 的 document.xml)。
 function escapeXml(value) {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
 
+// 生成一个 DOCX 段落 XML(可选标题样式)。
 function docxParagraph(text, heading = false) {
   if (!text) return "<w:p/>";
   const pPr = heading ? `<w:pPr><w:jc w:val="center"/><w:spacing w:before="120" w:after="160"/></w:pPr>` : "";
@@ -2573,6 +2712,7 @@ function docxParagraph(text, heading = false) {
   return `<w:p>${pPr}<w:r>${rPr}<w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
 }
 
+// 组装最小可用的 DOCX(OOXML 三件套 + 正文),返回字节数组。
 function buildDocx(title, bodyText) {
   const lines = String(bodyText || "").replace(/\r\n?/g, "\n").split("\n");
   const paragraphs = [docxParagraph(title || lines[0] || "文书", true)];
@@ -2590,6 +2730,7 @@ function buildDocx(title, bodyText) {
   return new Blob([zip], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" });
 }
 
+// 生成 DOCX 并触发浏览器下载。
 function downloadDocx(filename, title, bodyText) {
   const link = document.createElement("a");
   link.href = URL.createObjectURL(buildDocx(title, bodyText));
@@ -2598,9 +2739,10 @@ function downloadDocx(filename, title, bodyText) {
   window.setTimeout(() => URL.revokeObjectURL(link.href), 500);
 }
 
+// 全局点击事件委托:统一处理 data-route 路由跳转与 data-action 各类动作(先做权限校验)。
 document.addEventListener("click", async event => {
   const routeButton = event.target.closest("[data-route]");
-  if (routeButton) {
+  if (routeButton) {                                   // 带 data-route 的元素=切换页面。
     activeRoute = routeButton.dataset.route;
     renderPage();
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -3079,6 +3221,7 @@ document.addEventListener("click", async event => {
   }
 });
 
+// 全局表单提交委托:按 form id 分发到对应 save* 处理函数。
 document.addEventListener("submit", event => {
   event.preventDefault();
   if (event.target.id === "user-form") saveUser(event.target);
@@ -3097,6 +3240,7 @@ document.addEventListener("submit", event => {
   if (event.target.id === "client-form") saveClient(event.target);
 });
 
+// 全局输入委托:文档编辑器/期限输入/归档检索等的即时联动(不重渲整页以保焦点)。
 document.addEventListener("input", event => {
   if (event.target.id === "document-editor") {
     documentDraft = event.target.value;
@@ -3113,6 +3257,7 @@ document.addEventListener("input", event => {
   }
 });
 
+// 全局 change 委托:案件选择器、版本对比下拉、期限类型、设置开关等。
 document.addEventListener("change", event => {
   if (event.target === caseSelect) {
     state.activeCaseId = event.target.value;
@@ -3144,6 +3289,7 @@ document.addEventListener("change", event => {
   }
 });
 
+// 全局键盘委托:检索框回车检索等快捷键。
 document.addEventListener("keydown", event => {
   if (event.key === "Enter" && event.target.id === "legal-search-input") {
     event.preventDefault();
@@ -3161,10 +3307,12 @@ document.querySelector("#quick-search").addEventListener("click", () => {
   renderPage();
 });
 
+// 顶栏铃铛:打开通知中心(仅服务端模式)。
 document.querySelector("#notifications-button").addEventListener("click", () => {
   if (apiMode) notificationsDialog();
 });
 
+// URL hash 深链:#cases 等切换到对应页(便于分享/截图)。
 window.addEventListener?.("hashchange", () => {
   const route = (location.hash || "").replace(/^#/, "");
   if (Object.prototype.hasOwnProperty.call(routeMeta, route) && route !== activeRoute) {
@@ -3173,6 +3321,7 @@ window.addEventListener?.("hashchange", () => {
   }
 });
 
+// 登录表单提交:成功后进入应用并初始化。
 loginForm.addEventListener("submit", async event => {
   event.preventDefault();
   const data = formDataObject(loginForm);
@@ -3193,12 +3342,13 @@ loginForm.addEventListener("submit", async event => {
   }
 });
 
+// 退出:先把未同步状态推上去,再注销服务端会话,最后清本地态回登录页。
 logoutButton.addEventListener("click", async () => {
   try {
     await flushStateSync();
     await apiRequest("/api/auth/logout", { method: "POST", body: {} });
   } catch (error) {
-    // The local session is cleared even if the server is already unavailable.
+    // 即使服务端已不可达也照常清除本地会话。
   }
   currentUser = null;
   grantedPermissions = [];
@@ -3206,10 +3356,11 @@ logoutButton.addEventListener("click", async () => {
   showLogin();
 });
 
+// 点击弹窗背景(内容区之外)关闭弹窗。
 dialog.addEventListener("click", event => {
   const rect = dialog.getBoundingClientRect();
   const outside = event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
   if (outside) dialog.close();
 });
 
-initializeApp();
+initializeApp(); // 启动应用。

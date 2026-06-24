@@ -11,22 +11,24 @@ export const templateLabels = {
   execution: "强制执行申请书"
 };
 
-// 证据缺口提示（与客户端 evidenceGapNote 对应）。
+// 证据缺口提示（与客户端 evidenceGapNote 对应）：根据证据核验情况追加一段提醒文字。
 function evidenceGapNote(caseItem, evidence) {
-  const pending = evidence.filter(item => item.status !== "已核验");
-  if (!evidence.length) return "\n\n【证据提示】当前未录入证据，请补充证据材料后再行提交。";
-  if (pending.length) return `\n\n【证据提示】以下证据尚未核验：${pending.map(item => item.name).join("、")}，提交前应完成核验。`;
-  return "";
+  const pending = evidence.filter(item => item.status !== "已核验"); // 挑出尚未核验的证据。
+  if (!evidence.length) return "\n\n【证据提示】当前未录入证据，请补充证据材料后再行提交。"; // 完全没有证据。
+  if (pending.length) return `\n\n【证据提示】以下证据尚未核验：${pending.map(item => item.name).join("、")}，提交前应完成核验。`; // 有未核验证据时点名列出。
+  return ""; // 证据齐备且均已核验,不追加提示。
 }
 
 // 生成指定类型的文书草稿文本。
+// template: 文书类型键(见 templateLabels);caseItem: 案件对象;evidence/assetClues: 该案证据与财产线索。
 export function renderDocumentTemplate(template, caseItem, evidence = [], assetClues = []) {
-  if (!caseItem) return "请先新建并选择案件。";
+  if (!caseItem) return "请先新建并选择案件。"; // 没有案件无法生成,直接返回提示。
+  // 证据概览文本:有证据则逐条编号列出"名称：证明目的",否则给占位提示。
   const evidenceText = evidence.length
     ? evidence.map((item, index) => `${index + 1}. ${item.name}：${item.fact}。`).join("\n")
     : "暂无已录入证据，请补充证据材料。";
-  const header = `案件：${caseItem.title}\n案号：${caseItem.caseNo}\n受理法院：${caseItem.court}`;
-  const verify = "\n\n【系统提示】本稿根据已录入信息自动生成。事实、请求、金额、管辖、期限和法律依据须由办案人员核验后使用。";
+  const header = `案件：${caseItem.title}\n案号：${caseItem.caseNo}\n受理法院：${caseItem.court}`; // 多类文书共用的抬头三要素。
+  const verify = "\n\n【系统提示】本稿根据已录入信息自动生成。事实、请求、金额、管辖、期限和法律依据须由办案人员核验后使用。"; // 统一附在文末的核验声明。
   const templates = {
     complaint: `民事起诉状\n\n原告：${caseItem.client}\n被告：${caseItem.opposingParty}\n\n诉讼请求\n${caseItem.claims}\n\n事实与理由\n${caseItem.facts}\n\n证据概览\n${evidenceText}\n\n此致\n${caseItem.court}\n\n具状人：${caseItem.client}\n日期：____年__月__日`,
     defense: `民事答辩状\n\n答辩人：${caseItem.client}\n对方当事人：${caseItem.opposingParty}\n\n答辩意见\n一、对对方请求权基础及事实主张逐项回应。\n二、结合合同履行、证据真实性和损失计算提出抗辩。\n三、对程序事项和期限事项进行独立核验。\n\n案件事实摘要\n${caseItem.facts}\n\n拟引用证据\n${evidenceText}\n\n此致\n${caseItem.court}`,
@@ -35,6 +37,8 @@ export function renderDocumentTemplate(template, caseItem, evidence = [], assetC
     appeal: `民事上诉状\n\n上诉人：${caseItem.client}\n被上诉人：${caseItem.opposingParty}\n\n上诉请求\n请根据一审裁判主文、具体异议和上诉利益补充。\n\n事实与理由\n一、一审事实认定需复核之处：____。\n二、证据采信与证明责任分配需复核之处：____。\n三、法律适用需复核之处：____。\n\n相关案件事实\n${caseItem.facts}\n\n此致\n有管辖权的上级人民法院`,
     execution: `强制执行申请书\n\n申请执行人：${caseItem.client}\n被执行人：${caseItem.opposingParty}\n\n执行依据\n${caseItem.caseNo}\n\n执行请求\n${caseItem.claims}\n\n事实与理由\n相关法律文书已经发生法律效力，被执行人未按期履行确定义务，现申请依法强制执行。\n\n财产线索\n${assetClues.map((item, index) => `${index + 1}. ${item.type}：${item.description}（${item.status}）`).join("\n") || "暂无已录入财产线索。"}\n\n此致\n${caseItem.court}`
   };
+  // 仅对依赖证据论证的四类文书追加证据缺口提示;上诉状/执行申请书不需要。
   const gapNote = ["complaint", "defense", "opinion", "evidenceList"].includes(template) ? evidenceGapNote(caseItem, evidence) : "";
+  // 取对应模板(未知类型回退到起诉状),拼上证据提示与核验声明后返回。
   return (templates[template] || templates.complaint) + gapNote + verify;
 }

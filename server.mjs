@@ -1,26 +1,28 @@
-import http from "node:http";
-import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+// 衡法 AI 办案台服务端:零第三方依赖的 Node + SQLite,提供认证、权限、状态同步、
+// 文件抽取、FTS5 法律检索、文书/类案/庭审等 AI 能力,并托管前端与 Word/WPS 插件静态文件。
+import http from "node:http";                                                            // 内置 HTTP 服务器。
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";      // 哈希、随机、scrypt 口令、定时安全比较。
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"; // 文件系统读写。
+import { spawnSync } from "node:child_process";                                          // 调用 Python/外部抽取与转写。
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { openDatabase } from "./db.mjs";
-import { legalCorpus } from "./legal-corpus.mjs";
-import { precedentCorpus } from "./precedent-corpus.mjs";
-import { defaultHolidayCalendars } from "./holidays.mjs";
-import { extractTextLocally, localExtractionCapabilities } from "./ocr.mjs";
-import { transcriptionCapabilities, transcribeAudioLocally, parseTranscript } from "./transcribe.mjs";
-import { renderDocumentTemplate, templateLabels } from "./document-templates.mjs";
+import { openDatabase } from "./db.mjs";                       // SQLite 适配层。
+import { legalCorpus } from "./legal-corpus.mjs";              // 法条样例语料(首启播种)。
+import { precedentCorpus } from "./precedent-corpus.mjs";      // 类案裁判要旨样例语料。
+import { defaultHolidayCalendars } from "./holidays.mjs";      // 法定节假日默认数据。
+import { extractTextLocally, localExtractionCapabilities } from "./ocr.mjs"; // 零依赖文字抽取兜底。
+import { transcriptionCapabilities, transcribeAudioLocally, parseTranscript } from "./transcribe.mjs"; // 庭审语音转写。
+import { renderDocumentTemplate, templateLabels } from "./document-templates.mjs"; // 文书模板(与插件共享)。
 
-const root = path.dirname(fileURLToPath(import.meta.url));
-const host = "127.0.0.1";
-const port = Number(process.env.PORT || 4173);
-const dataDir = process.env.HENGFA_DATA_DIR ? path.resolve(process.env.HENGFA_DATA_DIR) : path.join(root, "data");
-const uploadsDir = path.join(dataDir, "uploads");
-const sessionCookie = "hengfa_session";
-const sessionHours = 8;
-const bodyLimit = 3 * 1024 * 1024;
-const fileLimit = 25 * 1024 * 1024;
+const root = path.dirname(fileURLToPath(import.meta.url));     // 项目根目录(本文件所在处)。
+const host = "127.0.0.1";                                      // 仅监听本机回环,默认不对外暴露。
+const port = Number(process.env.PORT || 4173);                // 监听端口(可经 PORT 覆盖)。
+const dataDir = process.env.HENGFA_DATA_DIR ? path.resolve(process.env.HENGFA_DATA_DIR) : path.join(root, "data"); // 数据目录(DB+上传)。
+const uploadsDir = path.join(dataDir, "uploads");             // 案件文件存放目录(不经静态 URL 暴露)。
+const sessionCookie = "hengfa_session";                      // 会话 Cookie 名。
+const sessionHours = 8;                                       // 会话有效时长(小时)。
+const bodyLimit = 3 * 1024 * 1024;                           // JSON 请求体上限 3MB。
+const fileLimit = 25 * 1024 * 1024;                          // 上传文件上限 25MB。
 
 // AI 能力中台基座模型：本系统统一指定 Claude 为生成式基座，但默认关闭（本地优先）。
 // 设 HENGFA_LLM=claude 且配置 ANTHROPIC_API_KEY 后，问答 / 事实抽取 / 裁判倾向综述改为
@@ -48,47 +50,49 @@ const rolePermissions = {
   client: []
 };
 
-mkdirSync(dataDir, { recursive: true });
-mkdirSync(uploadsDir, { recursive: true });
+mkdirSync(dataDir, { recursive: true });    // 确保数据目录存在。
+mkdirSync(uploadsDir, { recursive: true }); // 确保上传子目录存在。
+// 打开数据库:WAL 提升并发,开启外键约束,设 5 秒忙等待避免锁冲突即报错。
 const db = await openDatabase(path.join(dataDir, "hengfa.db"), "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+// 一次性建表(IF NOT EXISTS,幂等)。业务实体(案件/证据/任务等)不在此,而是以 JSON 存于 workspace_states。
 db.exec(`
-  CREATE TABLE IF NOT EXISTS workspaces (
+  CREATE TABLE IF NOT EXISTS workspaces (   -- 工作区(本系统目前为单工作区)
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     created_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS users (
+  CREATE TABLE IF NOT EXISTS users (        -- 成员账号与角色
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-    password_hash TEXT NOT NULL,
-    password_salt TEXT NOT NULL,
-    role TEXT NOT NULL CHECK(role IN ('admin','lawyer','assistant','client')),
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,  -- 邮箱唯一且大小写不敏感
+    password_hash TEXT NOT NULL,               -- scrypt 派生哈希
+    password_salt TEXT NOT NULL,               -- 每用户独立盐
+    role TEXT NOT NULL CHECK(role IN ('admin','lawyer','assistant','client')), -- 四类角色
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')), -- 启用/停用
     created_at TEXT NOT NULL,
     last_login TEXT
   );
-  CREATE TABLE IF NOT EXISTS sessions (
+  CREATE TABLE IF NOT EXISTS sessions (     -- 登录会话(Cookie 令牌只存哈希)
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash TEXT NOT NULL UNIQUE,
-    csrf_token TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,           -- 会话令牌的 sha256(原值仅存浏览器 Cookie)
+    csrf_token TEXT NOT NULL,                  -- 配套 CSRF 令牌
     created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL                   -- 过期时间
   );
-  CREATE TABLE IF NOT EXISTS workspace_states (
+  CREATE TABLE IF NOT EXISTS workspace_states ( -- 工作区业务状态(案件/证据/任务...的 JSON 快照 + 版本号)
     workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id),
-    revision INTEGER NOT NULL DEFAULT 0,
-    data_json TEXT NOT NULL DEFAULT '{}',
+    revision INTEGER NOT NULL DEFAULT 0,        -- 乐观锁版本号
+    data_json TEXT NOT NULL DEFAULT '{}',       -- 整个工作区状态的 JSON
     updated_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS case_access (
+  CREATE TABLE IF NOT EXISTS case_access (   -- 当事人(client)对具体案件的访问授权
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     case_id TEXT NOT NULL,
     PRIMARY KEY(user_id, case_id)
   );
-  CREATE TABLE IF NOT EXISTS audit_logs (
+  CREATE TABLE IF NOT EXISTS audit_logs (    -- 操作审计留痕
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     user_id TEXT REFERENCES users(id),
@@ -97,54 +101,54 @@ db.exec(`
     ip TEXT,
     created_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS case_files (
+  CREATE TABLE IF NOT EXISTS case_files (   -- 案件上传文件元数据 + 抽取文本(文件本体在 uploads/)
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     case_id TEXT NOT NULL,
-    original_name TEXT NOT NULL,
-    stored_name TEXT NOT NULL,
+    original_name TEXT NOT NULL,                -- 原始文件名
+    stored_name TEXT NOT NULL,                  -- 落盘文件名(id+扩展名)
     mime_type TEXT NOT NULL,
     size INTEGER NOT NULL,
-    sha256 TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('processed','partial','error')),
-    extraction_method TEXT,
-    extracted_text TEXT,
+    sha256 TEXT NOT NULL,                       -- 内容校验值
+    status TEXT NOT NULL CHECK(status IN ('processed','partial','error')), -- 抽取结果状态
+    extraction_method TEXT,                     -- 抽取方式(pdf-text/image-ocr/transcript:... 等)
+    extracted_text TEXT,                        -- 抽取/转写出的文本(供检索与事实抽取)
     error_message TEXT,
     uploaded_by TEXT REFERENCES users(id),
     created_at TEXT NOT NULL,
     processed_at TEXT
   );
-  CREATE TABLE IF NOT EXISTS legal_sources (
+  CREATE TABLE IF NOT EXISTS legal_sources (   -- 法源条目(法条/司法解释等)
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     title TEXT NOT NULL,
-    authority TEXT NOT NULL,
-    level TEXT NOT NULL,
-    effective_status TEXT NOT NULL,
-    effective_date TEXT,
-    valid_until TEXT,
+    authority TEXT NOT NULL,                    -- 制定机关
+    level TEXT NOT NULL,                        -- 效力层级(法律/行政法规/司法解释...)
+    effective_status TEXT NOT NULL,             -- 效力状态(有效/废止/失效...)
+    effective_date TEXT,                        -- 生效日期
+    valid_until TEXT,                           -- 有效期至(到期提醒用)
     source_url TEXT,
     created_by TEXT REFERENCES users(id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
-  CREATE VIRTUAL TABLE IF NOT EXISTS legal_chunks_fts USING fts5(
-    chunk_id UNINDEXED,
-    source_id UNINDEXED,
-    search_text,
-    content UNINDEXED
+  CREATE VIRTUAL TABLE IF NOT EXISTS legal_chunks_fts USING fts5( -- 法源分块的 FTS5 全文索引
+    chunk_id UNINDEXED,                         -- 分块 id(不索引,仅存储)
+    source_id UNINDEXED,                        -- 所属法源 id
+    search_text,                                -- 参与 BM25 检索的分词文本
+    content UNINDEXED                           -- 原文片段(展示用)
   );
-  CREATE TABLE IF NOT EXISTS legal_source_revisions (
+  CREATE TABLE IF NOT EXISTS legal_source_revisions ( -- 法源字段变更留痕(谁/何时/由何值改为何值)
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    field TEXT NOT NULL,
+    field TEXT NOT NULL,                        -- 变更字段名
     old_value TEXT,
     new_value TEXT,
     changed_by TEXT REFERENCES users(id),
     changed_at TEXT NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS holiday_calendars (
+  CREATE TABLE IF NOT EXISTS holiday_calendars ( -- 各年度法定节假日/调休表(期限顺延用)
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
     year TEXT NOT NULL,
     verified INTEGER NOT NULL DEFAULT 0,
@@ -154,56 +158,57 @@ db.exec(`
     updated_by TEXT REFERENCES users(id),
     PRIMARY KEY(workspace_id, year)
   );
+  -- 下列索引加速高频查询(会话令牌、审计/文件/法源按时间倒序等)。
   CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
   CREATE INDEX IF NOT EXISTS idx_audit_workspace_time ON audit_logs(workspace_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_case_files_case ON case_files(workspace_id, case_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_legal_sources_workspace ON legal_sources(workspace_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_legal_revisions_source ON legal_source_revisions(source_id, changed_at DESC);
-  CREATE TABLE IF NOT EXISTS precedents (
+  CREATE TABLE IF NOT EXISTS precedents (    -- 类案裁判要旨(检索 + 裁判倾向)
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    court TEXT NOT NULL,
-    cause TEXT NOT NULL,
-    outcome TEXT NOT NULL,
+    court TEXT NOT NULL,                        -- 审理法院
+    cause TEXT NOT NULL,                        -- 案由
+    outcome TEXT NOT NULL,                      -- 裁判结果(支持/部分支持/驳回)
     year TEXT,
     title TEXT NOT NULL,
-    gist TEXT NOT NULL,
+    gist TEXT NOT NULL,                         -- 裁判要旨正文
     source_url TEXT,
     created_at TEXT NOT NULL
   );
-  CREATE VIRTUAL TABLE IF NOT EXISTS precedent_fts USING fts5(
+  CREATE VIRTUAL TABLE IF NOT EXISTS precedent_fts USING fts5( -- 类案要旨的 FTS5 索引
     precedent_id UNINDEXED,
-    search_text,
+    search_text,                               -- 案由+标题+标签+要旨的分词
     content UNINDEXED
   );
   CREATE INDEX IF NOT EXISTS idx_precedents_workspace ON precedents(workspace_id, created_at DESC);
-  CREATE TABLE IF NOT EXISTS notifications (
+  CREATE TABLE IF NOT EXISTS notifications (  -- 通知中心条目(到期/逾期/冲突等提醒)
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
-    type TEXT NOT NULL,
-    level TEXT NOT NULL,
+    type TEXT NOT NULL,                         -- 提醒类型(legal_expiry/deadline_overdue...)
+    level TEXT NOT NULL,                        -- 紧急程度
     title TEXT NOT NULL,
     detail TEXT NOT NULL,
-    dedupe_key TEXT NOT NULL,
-    meta_json TEXT NOT NULL DEFAULT '{}',
+    dedupe_key TEXT NOT NULL,                   -- 去重键,避免同一事项反复生成
+    meta_json TEXT NOT NULL DEFAULT '{}',       -- 跳转所需的元数据(案件/法源 id 等)
     created_at TEXT NOT NULL,
-    read_at TEXT,
-    UNIQUE(workspace_id, dedupe_key)
+    read_at TEXT,                               -- 已读时间(NULL=未读)
+    UNIQUE(workspace_id, dedupe_key)            -- 同工作区同事项只保留一条
   );
   CREATE INDEX IF NOT EXISTS idx_notifications_workspace ON notifications(workspace_id, created_at DESC);
-  CREATE TABLE IF NOT EXISTS notification_prefs (
+  CREATE TABLE IF NOT EXISTS notification_prefs ( -- 每用户的提醒偏好
     user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    lead_days INTEGER NOT NULL DEFAULT 7,
-    muted_types TEXT NOT NULL DEFAULT '[]',
-    channels TEXT NOT NULL DEFAULT '["inapp"]',
+    lead_days INTEGER NOT NULL DEFAULT 7,        -- 临期提前天数
+    muted_types TEXT NOT NULL DEFAULT '[]',      -- 屏蔽的提醒类型(JSON 数组)
+    channels TEXT NOT NULL DEFAULT '["inapp"]',  -- 接收渠道(站内/外部)
     updated_at TEXT
   );
-  CREATE TABLE IF NOT EXISTS webhook_outbox (
+  CREATE TABLE IF NOT EXISTS webhook_outbox ( -- 外部提醒投递队列(失败留痕 + 重试)
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
-    payload_json TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    attempts INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL,                 -- 待投递的日报负载
+    status TEXT NOT NULL DEFAULT 'pending',      -- pending/sent/failed
+    attempts INTEGER NOT NULL DEFAULT 0,         -- 已尝试次数
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT
@@ -211,57 +216,63 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_outbox_status ON webhook_outbox(status, created_at);
 `);
 
-// 迁移:为已存在的库补充新增列。
+// 迁移:为早于这些字段的旧库补列(新库已含,故先探测 PRAGMA table_info 再 ALTER)。
 if (!db.prepare("PRAGMA table_info(legal_sources)").all().some(col => col.name === "valid_until")) {
-  db.exec("ALTER TABLE legal_sources ADD COLUMN valid_until TEXT");
+  db.exec("ALTER TABLE legal_sources ADD COLUMN valid_until TEXT"); // 旧库补"有效期至"列。
 }
 if (!db.prepare("PRAGMA table_info(notifications)").all().some(col => col.name === "meta_json")) {
-  db.exec("ALTER TABLE notifications ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}'");
+  db.exec("ALTER TABLE notifications ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}'"); // 旧库补元数据列。
 }
 
+// 生成带前缀的随机 id(如 user_xxxx),96 位随机足够避免碰撞。
 function id(prefix) {
   return `${prefix}_${randomBytes(12).toString("hex")}`;
 }
 
+// 当前时间的 ISO 字符串(全库统一用字符串存时间)。
 function isoNow() {
   return new Date().toISOString();
 }
 
+// 对值取 sha256 十六进制(用于会话令牌只存哈希、不存原值)。
 function hashToken(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+// 口令派生:scrypt(口令, 盐)→ 64 字节哈希;每次默认生成新盐。
 function hashPassword(password, salt = randomBytes(16).toString("hex")) {
   return { salt, hash: scryptSync(password, salt, 64).toString("hex") };
 }
 
+// 校验口令:用同盐重算并以"定时安全比较"防时序侧信道,长度不一直接判否。
 function verifyPassword(password, salt, expectedHex) {
   const actual = scryptSync(password, salt, 64);
   const expected = Buffer.from(expectedHex, "hex");
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+// 首启播种:建工作区、空状态、初始管理员,并写入法源/类案/节假日样例。每次启动调用(各步幂等)。
 function seedDatabase() {
   const workspaceId = "workspace_hengfa";
   const now = isoNow();
-  db.prepare("INSERT OR IGNORE INTO workspaces (id, name, created_at) VALUES (?, ?, ?)").run(workspaceId, "衡法律师工作区", now);
-  db.prepare("INSERT OR IGNORE INTO workspace_states (workspace_id, revision, data_json, updated_at) VALUES (?, 0, '{}', ?)").run(workspaceId, now);
+  db.prepare("INSERT OR IGNORE INTO workspaces (id, name, created_at) VALUES (?, ?, ?)").run(workspaceId, "衡法律师工作区", now); // 工作区(已存在则忽略)。
+  db.prepare("INSERT OR IGNORE INTO workspace_states (workspace_id, revision, data_json, updated_at) VALUES (?, 0, '{}', ?)").run(workspaceId, now); // 空业务状态。
 
-  const userCount = Number(db.prepare("SELECT COUNT(*) AS count FROM users").get().count);
-  if (!userCount) {
-    const email = process.env.HENGFA_ADMIN_EMAIL || "admin@hengfa.local";
-    const password = process.env.HENGFA_ADMIN_PASSWORD || "Hengfa-Admin-2026";
-    const credentials = hashPassword(password);
+  const userCount = Number(db.prepare("SELECT COUNT(*) AS count FROM users").get().count); // 是否已有任何用户。
+  if (!userCount) { // 仅首次(无任何用户)创建初始管理员。
+    const email = process.env.HENGFA_ADMIN_EMAIL || "admin@hengfa.local";       // 管理员邮箱(可环境变量配置)。
+    const password = process.env.HENGFA_ADMIN_PASSWORD || "Hengfa-Admin-2026";  // 管理员初始密码。
+    const credentials = hashPassword(password);                                 // 派生盐+哈希(不存明文)。
     db.prepare(`INSERT INTO users
       (id, workspace_id, name, email, password_hash, password_salt, role, status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, 'admin', 'active', ?)`)
       .run(id("user"), workspaceId, "系统管理员", email.toLowerCase(), credentials.hash, credentials.salt, now);
     console.log(`Initial admin: ${email}`);
-    if (!process.env.HENGFA_ADMIN_PASSWORD) console.log("Initial password: Hengfa-Admin-2026 (change it after login)");
+    if (!process.env.HENGFA_ADMIN_PASSWORD) console.log("Initial password: Hengfa-Admin-2026 (change it after login)"); // 未自定义密码时提示默认值。
   }
-  seedLegalCorpus(workspaceId, now);
-  seedPrecedents(workspaceId, now);
-  seedHolidays(workspaceId, now);
+  seedLegalCorpus(workspaceId, now); // 法条样例。
+  seedPrecedents(workspaceId, now);  // 类案样例。
+  seedHolidays(workspaceId, now);    // 节假日表。
 }
 
 // 首次启动播种默认节假日表;之后由管理员集中维护(PUT /api/holidays/:year)。
@@ -359,14 +370,16 @@ function reminderMatchesPrefs(reminder, prefs) {
 }
 
 // 为订阅外部渠道的每位成员生成个性化日报(只含其关注类型与提前窗口)。
+// 为订阅了外部渠道(webhook)的每位在职成员,按其个人偏好筛选出专属提醒并生成个性化日报。
+// 返回 [{ name, email, digest }],便于外部系统按收件人分别群发。
 function buildReminderDeliveries(workspaceId, reminders, dateStr = isoNow().slice(0, 10)) {
   const members = db.prepare("SELECT id, name, email FROM users WHERE workspace_id = ? AND status = 'active'").all(workspaceId);
   const deliveries = [];
   for (const member of members) {
     const prefs = userPrefs(member.id);
-    if (!prefs.channels.includes("webhook")) continue;
-    const personal = reminders.filter(reminder => reminderMatchesPrefs(reminder, prefs));
-    if (!personal.length) continue;
+    if (!prefs.channels.includes("webhook")) continue;                       // 未订阅外部渠道的成员跳过。
+    const personal = reminders.filter(reminder => reminderMatchesPrefs(reminder, prefs)); // 只留该成员关注的提醒。
+    if (!personal.length) continue;                                          // 没有可发内容则不生成。
     deliveries.push({ name: member.name, email: member.email, digest: buildDigest(personal, dateStr) });
   }
   return deliveries;
@@ -478,6 +491,7 @@ function runReminderScan() {
   return allCreated;
 }
 
+// 按法源名称粗略推断制定机关(仅用于样例语料的展示)。
 function authorityFor(code) {
   if (code.includes("最高人民法院")) return "最高人民法院";
   if (code.includes("民法典") || code.includes("民事诉讼法")) return "全国人民代表大会常务委员会";
@@ -500,6 +514,7 @@ function seedLegalCorpus(workspaceId, now) {
   console.log(`Seeded ${legalCorpus.length} sample legal sources.`);
 }
 
+// 首次启动把类案裁判要旨样例写入 precedents 表与 FTS 索引(已有数据则跳过)。
 function seedPrecedents(workspaceId, now) {
   const existing = Number(db.prepare("SELECT COUNT(*) AS count FROM precedents WHERE workspace_id = ?").get(workspaceId).count);
   if (existing) return;
@@ -514,20 +529,22 @@ function seedPrecedents(workspaceId, now) {
   console.log(`Seeded ${precedentCorpus.length} sample precedents.`);
 }
 
-seedDatabase();
-db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(isoNow());
+seedDatabase();                                                 // 建工作区/管理员/样例数据(幂等)。
+db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(isoNow()); // 启动时清理过期会话。
 
+// 统一安全响应头(防嗅探/点击劫持/泄露 Referer 等);extra 可覆盖默认值(如插件页放宽 CSP)。
 function securityHeaders(extra = {}) {
   return {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",                        // 禁止 MIME 嗅探。
+    "X-Frame-Options": "DENY",                                  // 禁止被任意页面内嵌(插件页会删除此项)。
     "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()", // 关闭敏感设备权限。
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'", // 仅同源。
     ...extra
   };
 }
 
+// 发送 JSON 响应(带安全头与 no-store)。
 function sendJson(response, status, data, extraHeaders = {}) {
   response.writeHead(status, securityHeaders({
     "Content-Type": "application/json; charset=utf-8",
@@ -537,10 +554,12 @@ function sendJson(response, status, data, extraHeaders = {}) {
   response.end(JSON.stringify(data));
 }
 
+// 发送标准错误响应:{ error, code }。
 function sendError(response, status, message, code = "REQUEST_ERROR") {
   sendJson(response, status, { error: message, code });
 }
 
+// 解析 Cookie 头为对象(键值做 URL 解码)。
 function parseCookies(request) {
   return Object.fromEntries((request.headers.cookie || "").split(";").map(item => item.trim()).filter(Boolean).map(item => {
     const index = item.indexOf("=");
@@ -548,12 +567,13 @@ function parseCookies(request) {
   }));
 }
 
+// 读取并解析 JSON 请求体;超过 bodyLimit 抛 413,格式错误抛 400,空体返回 {}。
 async function readJson(request) {
   let size = 0;
   const chunks = [];
-  for await (const chunk of request) {
+  for await (const chunk of request) {                          // 流式累积请求体。
     size += chunk.length;
-    if (size > bodyLimit) throw Object.assign(new Error("请求数据过大"), { status: 413 });
+    if (size > bodyLimit) throw Object.assign(new Error("请求数据过大"), { status: 413 }); // 超限即断。
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
@@ -564,6 +584,7 @@ async function readJson(request) {
   }
 }
 
+// 读取二进制请求体(文件上传);超过 limit 抛 413。
 async function readBuffer(request, limit = fileLimit) {
   let size = 0;
   const chunks = [];
@@ -575,19 +596,23 @@ async function readBuffer(request, limit = fileLimit) {
   return Buffer.concat(chunks);
 }
 
+// 发送二进制响应(文件下载)。
 function sendBinary(response, status, body, headers = {}) {
   response.writeHead(status, securityHeaders({ "Cache-Control": "no-store", ...headers }));
   response.end(body);
 }
 
+// 把用户行裁剪为可对外返回的安全字段(不含口令哈希/盐)。
 function publicUser(row) {
   return { id: row.id, workspaceId: row.workspace_id, name: row.name, email: row.email, role: row.role, status: row.status };
 }
 
+// 角色 → 权限列表。
 function permissionsFor(role) {
   return rolePermissions[role] || [];
 }
 
+// 由请求 Cookie 解析会话:校验存在/未停用/未过期,过期则顺手删除。返回 {sessionId,csrfToken,user} 或 null。
 function authenticate(request) {
   const token = parseCookies(request)[sessionCookie];
   if (!token) return null;
@@ -602,12 +627,14 @@ function authenticate(request) {
   return { sessionId: row.session_id, csrfToken: row.csrf_token, user: publicUser(row) };
 }
 
+// 要求已登录:未登录则发 401 并返回 null(调用方据此提前返回)。
 function requireAuth(request, response) {
   const auth = authenticate(request);
   if (!auth) sendError(response, 401, "请先登录", "AUTH_REQUIRED");
   return auth;
 }
 
+// 校验 CSRF:请求头 x-csrf-token 必须与会话内令牌一致(防跨站写操作)。
 function requireCsrf(request, response, auth) {
   const token = request.headers["x-csrf-token"];
   if (!token || token !== auth.csrfToken) {
@@ -617,22 +644,26 @@ function requireCsrf(request, response, auth) {
   return true;
 }
 
+// 当前用户是否具备某权限。
 function hasPermission(auth, permission) {
   return permissionsFor(auth.user.role).includes(permission);
 }
 
+// 要求具备某权限:无则发 403 返回 false。
 function requirePermission(response, auth, permission) {
   if (hasPermission(auth, permission)) return true;
   sendError(response, 403, "当前角色无权执行此操作", "PERMISSION_DENIED");
   return false;
 }
 
+// 写一条审计记录(动作/详情/IP),字段做长度截断。
 function audit(auth, action, detail, request) {
   db.prepare(`INSERT INTO audit_logs (id, workspace_id, user_id, action, detail, ip, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(id("audit"), auth.user.workspaceId, auth.user.id, String(action).slice(0, 80), String(detail).slice(0, 500), request.socket.remoteAddress || "", isoNow());
 }
 
+// 读取工作区最近的审计记录(关联用户名)。
 function auditRows(workspaceId, limit = 100) {
   return db.prepare(`SELECT audit_logs.id, audit_logs.action, audit_logs.detail, audit_logs.created_at,
       audit_logs.user_id, users.name AS member
@@ -641,21 +672,25 @@ function auditRows(workspaceId, limit = 100) {
     .map(row => ({ id: row.id, action: row.action, detail: row.detail, caseId: "", member: row.member || "系统", createdAt: row.created_at }));
 }
 
+// 当事人可访问的案件 id 集合;非当事人返回 null(表示不受限,可访问全部)。
 function accessibleCaseIds(auth) {
   if (auth.user.role !== "client") return null;
   return new Set(db.prepare("SELECT case_id FROM case_access WHERE user_id = ?").all(auth.user.id).map(row => row.case_id));
 }
 
+// 读取并解析工作区业务状态 JSON(案件/证据/任务等)。
 function workspaceState(workspaceId) {
   const row = db.prepare("SELECT data_json FROM workspace_states WHERE workspace_id = ?").get(workspaceId);
   return JSON.parse(row?.data_json || "{}");
 }
 
+// 是否有权访问某案件:当事人查授权表,其他角色看案件是否存在于本工作区。
 function canAccessCase(auth, caseId) {
   if (auth.user.role === "client") return Boolean(db.prepare("SELECT 1 FROM case_access WHERE user_id = ? AND case_id = ?").get(auth.user.id, caseId));
   return (workspaceState(auth.user.workspaceId).cases || []).some(item => item.id === caseId);
 }
 
+// 把 case_files 行裁剪为前端用的对象;默认只给文本预览,includeText 时附完整抽取文本。
 function publicCaseFile(row, includeText = false) {
   const result = {
     id: row.id,
@@ -676,9 +711,10 @@ function publicCaseFile(row, includeText = false) {
   return result;
 }
 
+// 允许上传的文件类型(文档/图片/音频);音频供庭审转写。
 const allowedFileExtensions = new Set([".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".webm"]);
 
-let pythonExtractorReady = null;
+let pythonExtractorReady = null; // Python 加速器可用性的缓存(null=未探测)。
 
 // 是否可用 Python 加速器（PyMuPDF + python-docx）。优先用它处理中文 PDF/DOCX；
 // 不可用时自动回退到 ocr.mjs 的零依赖实现，使整套应用在无 Python 环境下仍可运行。
@@ -691,11 +727,12 @@ function pythonExtractorAvailable() {
   return pythonExtractorReady;
 }
 
+// 调用 scripts/extract_text.py 抽取文本,解析其 JSON 输出为统一结果结构。
 function extractWithPython(filePath) {
   const python = process.env.HENGFA_PYTHON_BIN || "python3";
   const result = spawnSync(python, [path.join(root, "scripts", "extract_text.py"), filePath], {
     encoding: "utf8",
-    timeout: 180000,
+    timeout: 180000,             // 扫描件 OCR 可能较慢。
     maxBuffer: 20 * 1024 * 1024
   });
   let data = {};
@@ -714,15 +751,17 @@ function extractWithPython(filePath) {
   };
 }
 
+// 抽取案件文件文本:优先 Python 加速器,出错则回退零依赖 ocr.mjs;文本上限 5MB。
 function extractCaseFile(filePath, mime = "") {
   let result = pythonExtractorAvailable() ? extractWithPython(filePath) : extractTextLocally(filePath, mime);
-  if (result.status === "error" && pythonExtractorAvailable()) {
+  if (result.status === "error" && pythonExtractorAvailable()) {          // Python 失败时回退本地实现。
     const fallback = extractTextLocally(filePath, mime);
     if (fallback.status !== "error") result = { ...fallback, method: `${fallback.method}-fallback` };
   }
   return { ...result, text: String(result.text || "").slice(0, 5_000_000) };
 }
 
+// 中文检索分词:英数字取≥2 连续串,中文取相邻"双字"二元组(bigram),最多 60 个 token。
 function legalSearchTokens(text) {
   const normalized = String(text || "").normalize("NFKC").toLowerCase();
   const tokens = new Set(normalized.match(/[a-z0-9]{2,}/g) || []);
@@ -732,6 +771,7 @@ function legalSearchTokens(text) {
   return [...tokens].slice(0, 60);
 }
 
+// 把长文按空行切成 ≤900 字的检索分块(无空行则定长切),最多 5000 块。
 function chunkLegalText(text) {
   const paragraphs = String(text || "").replace(/\r/g, "").split(/\n{2,}/).map(item => item.trim()).filter(Boolean);
   const chunks = [];
@@ -750,6 +790,7 @@ function chunkLegalText(text) {
   return chunks.slice(0, 5000);
 }
 
+// 为一条法源建/重建 FTS 索引:分块→事务内先删旧块再插新块(失败回滚)。
 function indexLegalSource(sourceId, text) {
   const chunks = chunkLegalText(text);
   const insert = db.prepare("INSERT INTO legal_chunks_fts (chunk_id, source_id, search_text, content) VALUES (?, ?, ?, ?)");
@@ -784,10 +825,11 @@ function isLapsedStatus(status) {
   return /废止|失效|已修改|尚未生效/.test(String(status || ""));
 }
 
+// 法源检索:对查询分词 → FTS5 MATCH(OR 连接) → 按 BM25 排序;默认排除失效法源。
 function searchLegalSources(workspaceId, query, limit = 8, { includeLapsed = false } = {}) {
   const tokens = legalSearchTokens(query);
-  if (!tokens.length) return [];
-  const match = tokens.map(token => `"${token.replaceAll('"', '""')}"`).join(" OR ");
+  if (!tokens.length) return [];                                  // 无有效 token 直接空结果。
+  const match = tokens.map(token => `"${token.replaceAll('"', '""')}"`).join(" OR "); // 每 token 加引号防注入,OR 召回。
   const lapsedClause = includeLapsed ? "" : `AND legal_sources.effective_status NOT LIKE '%废止%'
       AND legal_sources.effective_status NOT LIKE '%失效%'
       AND legal_sources.effective_status NOT LIKE '%已修改%'
@@ -935,10 +977,12 @@ const FACT_KEYWORDS = ["合同", "协议", "签订", "交付", "验收", "付款
 const DATE_RE = /\d{4}\s*年|\d{1,2}\s*月\s*\d{1,2}\s*日|\d{4}-\d{1,2}-\d{1,2}/;
 const AMOUNT_RE = /(?:人民币|¥)?\s*\d[\d,，]*(?:\.\d+)?\s*(?:元|万元)/;
 
+// 按中文句末标点/换行断句,只保留 8~220 字的句子(过短无信息、过长非要件句)。
 function splitSentences(text) {
   return String(text || "").replace(/\r/g, "").split(/(?<=[。！？；\n])/).map(s => s.trim()).filter(s => s.length >= 8 && s.length <= 220);
 }
 
+// 给句子打要件类型标签:时间/金额/当事人/权利义务(命中相应正则或关键词)。
 function factTypes(sentence, caseItem) {
   const types = [];
   if (DATE_RE.test(sentence)) types.push("时间");
@@ -994,6 +1038,7 @@ function findLegalReferences(content) {
   return [...refs];
 }
 
+// 归一金额串以便比对(去掉千分位逗号、空白、"人民币/¥")。
 function normalizeAmount(value) {
   return String(value).replace(/[,，\s人民币¥]/g, "");
 }
@@ -1038,6 +1083,7 @@ function verifyDocumentContent(workspaceId, content, caseItem, caseTexts, eviden
   };
 }
 
+// 取某案件所有已抽取出文本的文件(供事实抽取/引用校验/类案检索)。
 function caseFileTexts(workspaceId, caseId) {
   return db.prepare("SELECT original_name, extracted_text FROM case_files WHERE workspace_id = ? AND case_id = ? AND extracted_text IS NOT NULL AND length(extracted_text) > 0")
     .all(workspaceId, caseId)
@@ -1058,8 +1104,10 @@ async function claudeExtractFacts(caseItem, caseTexts) {
   }));
 }
 
+// 这些数组按 caseId 归属于具体案件,当事人视图需逐数组过滤。
 const caseScopedArrays = ["evidence", "tasks", "timeLogs", "assetClues", "documentVersions", "caseEvents"];
 
+// 按角色裁剪下发给前端的状态:当事人仅见授权案件且去除审计/设置;其他角色可带审计(需权限)。
 function filterStateForUser(state, auth) {
   const filtered = structuredClone(state || {});
   const allowed = accessibleCaseIds(auth);
@@ -1075,22 +1123,25 @@ function filterStateForUser(state, auth) {
   return filtered;
 }
 
+// 清洗客户端提交的状态:只保留白名单数组/字段并限量,防止写入异常结构。
 function sanitizeState(value) {
   const source = value && typeof value === "object" ? value : {};
   const clean = {};
   const arrays = ["cases", ...caseScopedArrays, "qaMessages"];
-  for (const key of arrays) clean[key] = Array.isArray(source[key]) ? source[key].slice(0, 10000) : [];
+  for (const key of arrays) clean[key] = Array.isArray(source[key]) ? source[key].slice(0, 10000) : []; // 每数组上限 1 万条。
   clean.activeCaseId = String(source.activeCaseId || "");
   clean.settings = source.settings && typeof source.settings === "object" ? source.settings : {};
   clean.metrics = source.metrics && typeof source.metrics === "object" ? source.metrics : {};
   return clean;
 }
 
+// 按角色合并状态写入,限制各角色可改范围:管理员全量;律师不可改工作区设置;
+// 助理只能改证据/任务/工时等业务数组(不动案件与设置);当事人(返回 null)不可写。
 function mergeByRole(currentState, incomingState, auth) {
   const current = sanitizeState(currentState);
   const incoming = sanitizeState(incomingState);
-  if (auth.user.role === "admin") return incoming;
-  if (auth.user.role === "lawyer") return { ...incoming, settings: current.settings };
+  if (auth.user.role === "admin") return incoming;                              // 管理员:整盘覆盖。
+  if (auth.user.role === "lawyer") return { ...incoming, settings: current.settings }; // 律师:保留原设置。
   if (auth.user.role === "assistant") {
     return {
       ...current,
@@ -1107,8 +1158,9 @@ function mergeByRole(currentState, incomingState, auth) {
   return null;
 }
 
-const loginAttempts = new Map();
+const loginAttempts = new Map(); // 登录失败计数(按 IP+邮箱),内存级限流。
 
+// 是否允许继续尝试登录:15 分钟窗口内失败 <5 次;窗口过期自动重置。
 function loginAllowed(key) {
   const now = Date.now();
   const entry = loginAttempts.get(key);
@@ -1119,18 +1171,22 @@ function loginAllowed(key) {
   return entry.count < 5;
 }
 
+// 记录一次登录失败(计数 +1)。
 function recordLoginFailure(key) {
   const entry = loginAttempts.get(key) || { count: 0, resetAt: Date.now() + 15 * 60 * 1000 };
   entry.count += 1;
   loginAttempts.set(key, entry);
 }
 
+// 所有 /api/* 请求的总分发器:按 方法+路径 依次匹配端点。除登录外都先过 requireAuth;
+// 写操作各自再校验 CSRF 与权限。匹配不到则在末尾返回 404。
 async function handleApi(request, response, url) {
+  // 登录:限流 → 校验口令 → 建会话(令牌只存哈希)→ 下发 HttpOnly Cookie + CSRF 令牌。
   if (request.method === "POST" && url.pathname === "/api/auth/login") {
     const body = await readJson(request);
     const email = String(body.email || "").trim().toLowerCase();
     const password = String(body.password || "");
-    const attemptKey = `${request.socket.remoteAddress || "local"}:${email}`;
+    const attemptKey = `${request.socket.remoteAddress || "local"}:${email}`;   // 限流键:IP+邮箱。
     if (!loginAllowed(attemptKey)) return sendError(response, 429, "登录尝试过多，请稍后再试", "LOGIN_RATE_LIMITED");
     const row = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
     if (!row || row.status !== "active" || !verifyPassword(password, row.password_salt, row.password_hash)) {
@@ -1153,13 +1209,16 @@ async function handleApi(request, response, url) {
     });
   }
 
+  // —— 以下端点均需登录 —— 。
   const auth = requireAuth(request, response);
   if (!auth) return;
 
+  // 当前会话信息(用户/CSRF/权限),前端启动时据此判断是否已登录。
   if (request.method === "GET" && url.pathname === "/api/session") {
     return sendJson(response, 200, { user: auth.user, csrfToken: auth.csrfToken, permissions: permissionsFor(auth.user.role) });
   }
 
+  // 退出:删会话并清 Cookie。
   if (request.method === "POST" && url.pathname === "/api/auth/logout") {
     if (!requireCsrf(request, response, auth)) return;
     audit(auth, "用户退出", `${auth.user.email} 退出系统`, request);
@@ -1167,6 +1226,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true }, { "Set-Cookie": `${sessionCookie}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0` });
   }
 
+  // 修改密码:校验原密码与强度,改后注销其它会话(仅保留当前)。
   if (request.method === "POST" && url.pathname === "/api/auth/change-password") {
     if (!requireCsrf(request, response, auth)) return;
     const body = await readJson(request);
@@ -1180,6 +1240,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true });
   }
 
+  // 文字抽取能力探测(给前端展示是否支持图片 OCR/扫描件等)。
   if (request.method === "GET" && url.pathname === "/api/ocr/capabilities") {
     const python = pythonExtractorAvailable();
     const local = localExtractionCapabilities();
@@ -1195,10 +1256,12 @@ async function handleApi(request, response, url) {
     });
   }
 
+  // 庭审语音转写能力探测(本地引擎是否就绪、是否启用 Claude 小结)。
   if (request.method === "GET" && url.pathname === "/api/hearing/capabilities") {
     return sendJson(response, 200, { ...transcriptionCapabilities(), llmSummary: llmEnabled, maxFileSize: fileLimit });
   }
 
+  // 列出案件文件(按访问权限过滤)。
   if (request.method === "GET" && url.pathname === "/api/files") {
     const requestedCaseId = String(url.searchParams.get("caseId") || "");
     const rows = requestedCaseId
@@ -1208,10 +1271,11 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { files });
   }
 
+  // 上传案件文件:校验类型/大小 → 落盘(0600,wx 防覆盖)→ 算 SHA256 → 抽取文本入库。
   if (request.method === "POST" && url.pathname === "/api/files") {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_evidence")) return;
     const caseId = String(url.searchParams.get("caseId") || "");
-    const originalName = path.basename(String(url.searchParams.get("name") || "未命名文件")).slice(0, 200);
+    const originalName = path.basename(String(url.searchParams.get("name") || "未命名文件")).slice(0, 200); // basename 防路径穿越。
     if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
     const extension = path.extname(originalName).toLowerCase();
     if (!allowedFileExtensions.has(extension)) return sendError(response, 415, "暂不支持该文件类型", "FILE_TYPE_UNSUPPORTED");
@@ -1233,6 +1297,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 201, { file: publicCaseFile(row, true) });
   }
 
+  // 下载案件文件原件(权限校验 + 附件方式返回,文件名 UTF-8 编码)。
   const fileDownloadMatch = url.pathname.match(/^\/api\/files\/([^/]+)\/download$/);
   if (request.method === "GET" && fileDownloadMatch) {
     const row = db.prepare("SELECT * FROM case_files WHERE id = ? AND workspace_id = ?").get(fileDownloadMatch[1], auth.user.workspaceId);
@@ -1246,6 +1311,7 @@ async function handleApi(request, response, url) {
     });
   }
 
+  // 重新抽取某文件的文本(如安装 Python 后重跑;更新 status/text)。
   const fileReprocessMatch = url.pathname.match(/^\/api\/files\/([^/]+)\/reprocess$/);
   if (request.method === "POST" && fileReprocessMatch) {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_evidence")) return;
@@ -1258,6 +1324,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { file: publicCaseFile(db.prepare("SELECT * FROM case_files WHERE id = ?").get(row.id), true) });
   }
 
+  // 单个文件:GET 取详情(含完整文本),DELETE 删除(同时删盘上文件)。
   const fileMatch = url.pathname.match(/^\/api\/files\/([^/]+)$/);
   if (request.method === "GET" && fileMatch) {
     const row = db.prepare("SELECT * FROM case_files WHERE id = ? AND workspace_id = ?").get(fileMatch[1], auth.user.workspaceId);
@@ -1275,6 +1342,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true });
   }
 
+  // 列出工作区法源(附检索片段数与变更次数)。
   if (request.method === "GET" && url.pathname === "/api/legal/sources") {
     const sources = db.prepare(`SELECT legal_sources.*,
         (SELECT COUNT(*) FROM legal_chunks_fts WHERE source_id = legal_sources.id) AS chunk_count,
@@ -1287,6 +1355,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { sources });
   }
 
+  // 单条新增法源:落库 → 建 FTS 索引 → 记"创建"留痕(索引失败则回滚删除)。
   if (request.method === "POST" && url.pathname === "/api/legal/sources") {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_settings")) return;
     const body = await readJson(request);
@@ -1381,6 +1450,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true, changes });
   }
 
+  // 删除法源(连带删除其 FTS 索引与变更记录)。
   if (request.method === "DELETE" && legalSourceMatch) {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_settings")) return;
     const source = db.prepare("SELECT * FROM legal_sources WHERE id = ? AND workspace_id = ?").get(legalSourceMatch[1], auth.user.workspaceId);
@@ -1392,6 +1462,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true });
   }
 
+  // 法律检索:FTS5/BM25 召回法源片段(可选含失效)。
   if (request.method === "POST" && url.pathname === "/api/legal/search") {
     if (!requireCsrf(request, response, auth)) return;
     const body = await readJson(request);
@@ -1428,13 +1499,14 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { impacts });
   }
 
+  // 检索增强问答:默认抽取式带引用;启用 Claude 时改为仅依据片段的生成式回答(失败回退抽取式)。
   if (request.method === "POST" && url.pathname === "/api/legal/answer") {
     if (!requireCsrf(request, response, auth)) return;
     const body = await readJson(request);
     const query = String(body.query || "").trim();
     if (!query) return sendError(response, 400, "请输入法律问题", "QUERY_REQUIRED");
     const results = searchLegalSources(auth.user.workspaceId, query, 5);
-    let answer = extractiveAnswer(results);
+    let answer = extractiveAnswer(results);          // 默认:摘录式回答。
     let generatedBy = "extractive";
     if (llmEnabled && results.length) {
       try {
@@ -1582,6 +1654,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { calendars: holidayCalendars(auth.user.workspaceId) });
   }
 
+  // 更新某年度节假日/调休(管理员;upsert + 留痕,全员共享生效)。
   const holidayMatch = url.pathname.match(/^\/api\/holidays\/(\d{4})$/);
   if (request.method === "PUT" && holidayMatch) {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_settings")) return;
@@ -1641,6 +1714,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { digest: buildDigest(items, isoNow().slice(0, 10)) });
   }
 
+  // 一键全部已读。
   if (request.method === "POST" && url.pathname === "/api/notifications/read-all") {
     if (!requireCsrf(request, response, auth)) return;
     db.prepare("UPDATE notifications SET read_at = ? WHERE workspace_id = ? AND read_at IS NULL").run(isoNow(), auth.user.workspaceId);
@@ -1656,6 +1730,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { configured: Boolean(process.env.HENGFA_REMINDER_WEBHOOK), pending, failed, log: rows });
   }
 
+  // 手动重试待发 webhook(管理员)。
   if (request.method === "POST" && url.pathname === "/api/notifications/webhook-retry") {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_settings")) return;
     await flushWebhookOutbox();
@@ -1665,6 +1740,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true, pending, failed });
   }
 
+  // 单条标记已读。
   const notifReadMatch = url.pathname.match(/^\/api\/notifications\/([^/]+)\/read$/);
   if (request.method === "POST" && notifReadMatch) {
     if (!requireCsrf(request, response, auth)) return;
@@ -1672,19 +1748,21 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true });
   }
 
+  // 启动引导:返回(按角色裁剪后的)业务状态、版本号、当前用户与权限。
   if (request.method === "GET" && url.pathname === "/api/bootstrap") {
     const row = db.prepare("SELECT revision, data_json FROM workspace_states WHERE workspace_id = ?").get(auth.user.workspaceId);
     const state = filterStateForUser(JSON.parse(row?.data_json || "{}"), auth);
     return sendJson(response, 200, { state, revision: Number(row?.revision || 0), user: auth.user, permissions: permissionsFor(auth.user.role) });
   }
 
+  // 保存业务状态:乐观锁(revision 不符返回 409)+ 按角色合并写入,版本号 +1。当事人只读。
   if (request.method === "PUT" && url.pathname === "/api/state") {
     if (!requireCsrf(request, response, auth)) return;
     if (auth.user.role === "client") return sendError(response, 403, "当事人账号仅可查看已授权案件", "READ_ONLY_ROLE");
     const body = await readJson(request);
     const row = db.prepare("SELECT revision, data_json FROM workspace_states WHERE workspace_id = ?").get(auth.user.workspaceId);
     const currentRevision = Number(row.revision);
-    if (Number(body.revision) !== currentRevision) return sendJson(response, 409, { error: "数据已被其他成员更新", code: "REVISION_CONFLICT", revision: currentRevision });
+    if (Number(body.revision) !== currentRevision) return sendJson(response, 409, { error: "数据已被其他成员更新", code: "REVISION_CONFLICT", revision: currentRevision }); // 版本冲突。
     const merged = mergeByRole(JSON.parse(row.data_json || "{}"), body.state, auth);
     if (!merged) return sendError(response, 403, "当前角色不可修改工作区数据", "READ_ONLY_ROLE");
     const nextRevision = currentRevision + 1;
@@ -1693,6 +1771,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true, revision: nextRevision });
   }
 
+  // 前端补记一条审计(如本地导出等动作)。
   if (request.method === "POST" && url.pathname === "/api/audit") {
     if (!requireCsrf(request, response, auth)) return;
     const body = await readJson(request);
@@ -1700,6 +1779,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 201, { ok: true });
   }
 
+  // 成员列表(管理员;附每人授权案件 id)。
   if (request.method === "GET" && url.pathname === "/api/users") {
     if (!requirePermission(response, auth, "manage_users")) return;
     const users = db.prepare("SELECT id, workspace_id, name, email, role, status, created_at, last_login FROM users WHERE workspace_id = ? ORDER BY created_at")
@@ -1712,6 +1792,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { users });
   }
 
+  // 新建成员(管理员):校验邮箱/角色/密码强度、查重,建账号并写入案件授权。
   if (request.method === "POST" && url.pathname === "/api/users") {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_users")) return;
     const body = await readJson(request);
@@ -1732,6 +1813,7 @@ async function handleApi(request, response, url) {
     return sendJson(response, 201, { user: publicUser(db.prepare("SELECT * FROM users WHERE id = ?").get(userId)) });
   }
 
+  // 更新成员(管理员):改姓名/角色/状态/案件授权;禁止停用自己;停用即注销其会话。
   const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/);
   if (request.method === "PATCH" && userMatch) {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "manage_users")) return;
@@ -1752,20 +1834,21 @@ async function handleApi(request, response, url) {
     return sendJson(response, 200, { ok: true });
   }
 
-  return sendError(response, 404, "API 不存在", "API_NOT_FOUND");
+  return sendError(response, 404, "API 不存在", "API_NOT_FOUND"); // 所有端点都没匹配到。
 }
 
 // Word/WPS 办公插件任务窗格的 CSP：仅放行 Office.js 官方 CDN，连接仍限本域。
 const pluginCsp = "default-src 'self'; script-src 'self' https://appsforoffice.microsoft.com https://res.cdn.office.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; frame-ancestors 'self' https://*.officeapps.live.com https://*.office.com https://*.wps.cn https://*.officeonline.wps.cn";
 const pluginFiles = new Set(["plugin/taskpane.html", "plugin/taskpane.js", "plugin/taskpane.css", "plugin/commands.html", "plugin/manifest.xml", "plugin/icon.png"]);
 
+// 托管静态文件:仅白名单(前端三件套 + plugin/ 下固定文件),并校验解析后路径仍在根目录内防穿越。
 function serveStatic(request, response, url) {
   try {
-    const relativePath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname).replace(/^\/+/, "");
+    const relativePath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname).replace(/^\/+/, ""); // "/" 映射到首页。
     const isPlugin = pluginFiles.has(relativePath);
-    if (!new Set(["index.html", "styles.css", "app.js"]).has(relativePath) && !isPlugin) throw new Error("Not public");
+    if (!new Set(["index.html", "styles.css", "app.js"]).has(relativePath) && !isPlugin) throw new Error("Not public"); // 非白名单一律 404。
     const filePath = path.resolve(root, relativePath);
-    if (!filePath.startsWith(`${root}${path.sep}`)) throw new Error("Invalid path");
+    if (!filePath.startsWith(`${root}${path.sep}`)) throw new Error("Invalid path"); // 解析后必须仍在根目录内。
     const fileStat = statSync(filePath);
     if (!fileStat.isFile()) throw new Error("Not a file");
     const body = readFileSync(filePath);
@@ -1786,6 +1869,7 @@ function serveStatic(request, response, url) {
   }
 }
 
+// HTTP 服务器:/api/* 交给 handleApi,其余 GET/HEAD 走静态托管;统一兜底异常(已发头则仅结束)。
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host || host}`);
   try {
@@ -1794,11 +1878,13 @@ const server = http.createServer(async (request, response) => {
     else sendError(response, 405, "请求方法不支持", "METHOD_NOT_ALLOWED");
   } catch (error) {
     console.error(error);
+    // 带 status 的错误(如 413/400)透出其消息,其余统一报 500 不泄露细节。
     if (!response.headersSent) sendError(response, error.status || 500, error.status ? error.message : "服务器内部错误", "SERVER_ERROR");
     else response.end();
   }
 });
 
+// 测试用 HENGFA_NO_LISTEN=1 仅加载模块不监听端口;正常运行则监听并启动后台提醒任务。
 if (process.env.HENGFA_NO_LISTEN !== "1") {
   server.listen(port, host, () => {
     console.log(`Hengfa workbench: http://${host}:${server.address().port}`);
@@ -1814,6 +1900,7 @@ if (process.env.HENGFA_NO_LISTEN !== "1") {
   }, reminderHours * 3600000).unref();
 }
 
+// 优雅退出:停止接收连接 → 关闭数据库 → 退出进程。
 function shutdown() {
   server.close(() => {
     db.close();
@@ -1821,7 +1908,8 @@ function shutdown() {
   });
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);   // Ctrl+C。
+process.on("SIGTERM", shutdown);  // 进程管理器终止。
 
+// 导出供测试与桌面端复用(handleApi/serveStatic 直接驱动,纯函数便于单测)。
 export { db, handleApi, serveStatic, server, runReminderScan, buildReminderDeliveries, purgeOldNotifications, flushWebhookOutbox, searchPrecedents, tendencyFromPrecedents, localHearingSummary };
