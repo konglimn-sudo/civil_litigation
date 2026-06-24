@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>衡法 · 文书助手</title>
+  <link rel="stylesheet" href="taskpane.css">
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <script src="taskpane.js" defer></script>
+</head>
+<body>
+  <header class="hf-head">
+    <div class="hf-brand">衡法 · 文书助手</div>
+    <div class="hf-sub">Word / WPS 办公插件 · 内容嵌入光标处</div>
+  </header>
+
+  <!-- 登录区：插件在宿主 webview 内独立登录衡法服务端 -->
+  <section id="login-pane" class="hf-card" hidden>
+    <h2>登录工作区</h2>
+    <p class="hf-hint">使用与衡法工作台相同的账号登录（插件与服务端同源）。</p>
+    <label>邮箱</label>
+    <input id="login-email" type="email" placeholder="admin@hengfa.local" autocomplete="username">
+    <label>密码</label>
+    <input id="login-password" type="password" autocomplete="current-password">
+    <button id="login-btn" class="hf-primary" type="button">登录</button>
+    <p id="login-msg" class="hf-msg" role="alert"></p>
+  </section>
+
+  <!-- 主功能区 -->
+  <main id="main-pane" hidden>
+    <div class="hf-row">
+      <span id="who" class="hf-who"></span>
+      <button id="logout-btn" class="hf-quiet" type="button">退出</button>
+    </div>
+
+    <section class="hf-card">
+      <label for="case-select">当前案件</label>
+      <select id="case-select"></select>
+    </section>
+
+    <section class="hf-card">
+      <h2>生成文书 → 插入</h2>
+      <select id="template-select">
+        <option value="complaint">民事起诉状</option>
+        <option value="defense">民事答辩状</option>
+        <option value="evidenceList">证据目录</option>
+        <option value="opinion">代理词</option>
+        <option value="appeal">民事上诉状</option>
+        <option value="execution">强制执行申请书</option>
+      </select>
+      <button id="gen-btn" class="hf-primary" type="button">生成并插入到光标处</button>
+    </section>
+
+    <section class="hf-card">
+      <h2>法律问答 → 插入（带依据）</h2>
+      <textarea id="qa-input" rows="3" placeholder="例如：电子证据原始载体如何核验？"></textarea>
+      <button id="qa-btn" class="hf-primary" type="button">检索并插入答案</button>
+    </section>
+
+    <section class="hf-card">
+      <h2>校验选中文本</h2>
+      <p class="hf-hint">选中正文中的一段文字，校验其法条引用与事实依据。</p>
+      <button id="verify-btn" class="hf-primary" type="button">校验当前选区</button>
+      <div id="verify-result" class="hf-result"></div>
+    </section>
+
+    <p class="hf-foot">生成内容均为草稿与辅助，须由办案人员核验事实、请求、金额、管辖、期限与法律依据。</p>
+  </main>
+
+  <div id="toast" class="hf-toast" role="status" aria-live="polite"></div>
+</body>
+</html>

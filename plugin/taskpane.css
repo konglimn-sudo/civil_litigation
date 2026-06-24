@@ -1,0 +1,70 @@
+:root {
+  --hf-bg: #f6f7f9;
+  --hf-surface: #ffffff;
+  --hf-line: #e3e6ea;
+  --hf-text: #1f2329;
+  --hf-muted: #6b7280;
+  --hf-teal: #0f766e;
+  --hf-red: #b91c1c;
+  --hf-gold: #b45309;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  color: var(--hf-text);
+  background: var(--hf-bg);
+  padding: 12px;
+}
+.hf-head { margin-bottom: 12px; }
+.hf-brand { font-size: 16px; font-weight: 700; color: var(--hf-teal); }
+.hf-sub { font-size: 11px; color: var(--hf-muted); margin-top: 2px; }
+.hf-card {
+  background: var(--hf-surface);
+  border: 1px solid var(--hf-line);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+.hf-card h2 { font-size: 13px; margin: 0 0 8px; }
+label { display: block; font-size: 11px; color: var(--hf-muted); margin: 8px 0 4px; }
+input, select, textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--hf-line);
+  border-radius: 8px;
+  font: inherit;
+  background: #fff;
+  color: inherit;
+}
+textarea { resize: vertical; }
+button { cursor: pointer; font: inherit; border-radius: 8px; border: 1px solid transparent; }
+.hf-primary {
+  width: 100%;
+  margin-top: 10px;
+  padding: 9px 12px;
+  background: var(--hf-teal);
+  color: #fff;
+  font-weight: 600;
+}
+.hf-primary:disabled { opacity: .55; cursor: default; }
+.hf-quiet { background: transparent; border-color: var(--hf-line); padding: 5px 10px; color: var(--hf-muted); }
+.hf-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.hf-who { font-size: 12px; color: var(--hf-muted); }
+.hf-hint, .hf-foot { font-size: 11px; color: var(--hf-muted); line-height: 1.6; }
+.hf-foot { margin-top: 8px; }
+.hf-msg { font-size: 12px; color: var(--hf-red); min-height: 16px; margin: 8px 0 0; }
+.hf-result { margin-top: 10px; }
+.hf-finding { padding: 8px; border: 1px solid var(--hf-line); border-radius: 8px; margin-bottom: 6px; }
+.hf-finding .lvl { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 999px; margin-right: 6px; color: #fff; }
+.lvl.high { background: var(--hf-red); }
+.lvl.medium { background: var(--hf-gold); }
+.lvl.low { background: var(--hf-teal); }
+.lvl.pass { background: #15803d; }
+.hf-toast {
+  position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+  background: #1f2329; color: #fff; padding: 8px 14px; border-radius: 8px;
+  font-size: 12px; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 90%;
+}
+.hf-toast.show { opacity: .96; }

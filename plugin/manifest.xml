@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  衡法 · Word/WPS 文书助手 Office 加载项清单。
+  ⚠️ 部署前请将下方所有 https://localhost:4173 替换为你的「HTTPS」部署地址：
+     Office/WPS 加载项要求任务窗格、命令页与图标均经 HTTPS 提供。
+     本地调试可用 office-addin-dev-certs 或 TLS 反向代理为衡法服务端启用 HTTPS。
+  Word（桌面/网页）与 WPS（兼容 Office.js 加载项）均可侧载本清单。
+-->
+<OfficeApp
+  xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+  xmlns:ov="http://schemas.microsoft.com/office/taskpaneappversionoverrides"
+  xsi:type="TaskPaneApp">
+
+  <Id>1c71de52-763b-4891-a142-52cba9ffb53a</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>衡法</ProviderName>
+  <DefaultLocale>zh-CN</DefaultLocale>
+  <DisplayName DefaultValue="衡法 · 文书助手" />
+  <Description DefaultValue="在 Word / WPS 中调用衡法工作区：生成诉讼文书、插入带依据的法律问答、校验引用与事实。" />
+  <IconUrl DefaultValue="https://localhost:4173/plugin/icon.png" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:4173/plugin/icon.png" />
+  <SupportUrl DefaultValue="https://localhost:4173/" />
+
+  <Hosts>
+    <Host Name="Document" />
+  </Hosts>
+
+  <DefaultSettings>
+    <SourceLocation DefaultValue="https://localhost:4173/plugin/taskpane.html" />
+  </DefaultSettings>
+
+  <Permissions>ReadWriteDocument</Permissions>
+
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/taskpaneappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Hosts>
+      <Host xsi:type="Document">
+        <DesktopFormFactor>
+          <GetStarted>
+            <Title resid="GetStarted.Title" />
+            <Description resid="GetStarted.Description" />
+            <LearnMoreUrl resid="GetStarted.LearnMoreUrl" />
+          </GetStarted>
+          <FunctionFile resid="Commands.Url" />
+          <ExtensionPoint xsi:type="PrimaryCommandSurface">
+            <OfficeTab id="TabHome">
+              <Group id="HengfaGroup">
+                <Label resid="Group.Label" />
+                <Icon>
+                  <bt:Image size="16" resid="Icon.16" />
+                  <bt:Image size="32" resid="Icon.32" />
+                  <bt:Image size="80" resid="Icon.80" />
+                </Icon>
+                <Control xsi:type="Button" id="HengfaTaskpaneButton">
+                  <Label resid="Taskpane.Label" />
+                  <Supertip>
+                    <Title resid="Taskpane.Label" />
+                    <Description resid="Taskpane.Tooltip" />
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="Icon.16" />
+                    <bt:Image size="32" resid="Icon.32" />
+                    <bt:Image size="80" resid="Icon.80" />
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <TaskpaneId>HengfaTaskpane</TaskpaneId>
+                    <SourceLocation resid="Taskpane.Url" />
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+
+    <Resources>
+      <bt:Images>
+        <bt:Image id="Icon.16" DefaultValue="https://localhost:4173/plugin/icon.png" />
+        <bt:Image id="Icon.32" DefaultValue="https://localhost:4173/plugin/icon.png" />
+        <bt:Image id="Icon.80" DefaultValue="https://localhost:4173/plugin/icon.png" />
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="Commands.Url" DefaultValue="https://localhost:4173/plugin/commands.html" />
+        <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:4173/plugin/taskpane.html" />
+        <bt:Url id="GetStarted.LearnMoreUrl" DefaultValue="https://localhost:4173/" />
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="GetStarted.Title" DefaultValue="衡法 · 文书助手已就绪" />
+        <bt:String id="Group.Label" DefaultValue="衡法" />
+        <bt:String id="Taskpane.Label" DefaultValue="文书助手" />
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="GetStarted.Description" DefaultValue="点击「文书助手」打开衡法任务窗格，生成文书、插入问答、校验引用。" />
+        <bt:String id="Taskpane.Tooltip" DefaultValue="打开衡法文书助手任务窗格。" />
+      </bt:LongStrings>
+    </Resources>
+  </VersionOverrides>
+</OfficeApp>

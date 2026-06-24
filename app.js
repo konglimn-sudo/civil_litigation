@@ -212,6 +212,11 @@ function createInitialState() {
     qaMessages: [
       { role: "assistant", text: "您好。我会优先从当前样例知识库中检索，并在回答后附上依据。请结合具体案情核验正式法源。", citations: [] }
     ],
+    clients: [
+      { id: "client-1", name: "张某", contact: "138-0000-0001", channel: "老客户转介绍", note: "建材买卖长期客户", caseIds: ["case-1"], createdAt: dateFromNow(-45) },
+      { id: "client-2", name: "李某", contact: "139-0000-0002", channel: "线上咨询", note: "民间借贷执行", caseIds: ["case-2"], createdAt: dateFromNow(-130) },
+      { id: "client-3", name: "海岳科技有限公司", contact: "021-5000-0003", channel: "合作律所推荐", note: "服务合同尾款争议", caseIds: ["case-3"], createdAt: dateFromNow(-10) }
+    ],
     settings: { localDeploy: true, masking: true, audit: true, sourceRequired: true },
     metrics: { documentsGenerated: 2 }
   };
@@ -256,10 +261,15 @@ let serverRevision = 0;
 let workspaceUsers = [];
 let caseFiles = [];
 let ocrCapabilities = null;
+let hearingCapabilities = null;
+let hearingTranscript = null;
+let hearingSummary = null;
 let legalSources = [];
 let legalRagResults = null;
 let legalIncludeLapsed = false;
 let citationImpacts = [];
+let strategyTendency = null;
+let archiveQuery = "";
 let notifications = [];
 let unreadCount = 0;
 let notifPrefs = { leadDays: 7, mutedTypes: [], channels: ["inapp"] };
@@ -372,12 +382,14 @@ async function loadWorkspaceUsers() {
 
 async function loadCaseFiles() {
   if (!apiMode) return;
-  const [fileData, capabilityData] = await Promise.all([
+  const [fileData, capabilityData, hearingCaps] = await Promise.all([
     apiRequest("/api/files"),
-    ocrCapabilities ? Promise.resolve(ocrCapabilities) : apiRequest("/api/ocr/capabilities")
+    ocrCapabilities ? Promise.resolve(ocrCapabilities) : apiRequest("/api/ocr/capabilities"),
+    hearingCapabilities ? Promise.resolve(hearingCapabilities) : apiRequest("/api/hearing/capabilities").catch(() => null)
   ]);
   caseFiles = fileData.files || [];
   ocrCapabilities = capabilityData;
+  hearingCapabilities = hearingCaps;
 }
 
 async function loadLegalSources() {
@@ -564,6 +576,87 @@ async function askLegalQuestion(query) {
     state.qaMessages.push({ role: "assistant", text: `检索失败：${error.message}`, citations: [] });
   }
   persist();
+  renderPage();
+}
+
+// 案情策略：检索类案并聚合裁判倾向参考。
+async function runStrategyTendency() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  if (!apiMode) return showToast("类案检索需登录服务端模式");
+  setSyncState("正在检索类案", "is-syncing");
+  try {
+    strategyTendency = await apiRequest("/api/strategy/tendency", { method: "POST", body: { caseId: caseItem.id } });
+    setSyncState("已同步");
+    if (!strategyTendency.precedents?.length) showToast("未检索到相似类案样例，可调整案由或事实关键词");
+  } catch (error) {
+    strategyTendency = null;
+    setSyncState("检索失败", "is-error");
+    showToast(error.message);
+  }
+  renderPage();
+}
+
+// 庭审语音转写：调用本地引擎转写已上传音频。
+async function runTranscribe(fileId) {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  if (!fileId) return showToast("请先选择庭审录音文件");
+  setSyncState("正在转写录音", "is-syncing");
+  try {
+    const data = await apiRequest("/api/hearing/transcribe", { method: "POST", body: { caseId: caseItem.id, fileId } });
+    if (data.method === "manual") {
+      hearingTranscript = null;
+      setSyncState("未检测到引擎", "is-error");
+      showToast("未检测到本地语音引擎，请改用「导入笔录」手工粘贴庭审笔录");
+    } else {
+      hearingTranscript = data;
+      hearingSummary = null;
+      setSyncState("已同步");
+      showToast(data.segments?.length ? `转写完成，共 ${data.segments.length} 段` : (data.error || "未识别到语音内容"));
+      await loadCaseFiles();
+    }
+  } catch (error) {
+    setSyncState("转写失败", "is-error");
+    showToast(error.message);
+  }
+  renderPage();
+}
+
+// 庭审语音转写：将粘贴/导入的笔录文本结构化为分段。
+async function runImportTranscript(text) {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  if (!text.trim()) return showToast("请粘贴或导入庭审笔录文本");
+  setSyncState("正在结构化笔录", "is-syncing");
+  try {
+    const data = await apiRequest("/api/hearing/transcribe", { method: "POST", body: { caseId: caseItem.id, text } });
+    hearingTranscript = data;
+    hearingSummary = null;
+    setSyncState("已同步");
+    showToast(`已结构化 ${data.segments?.length || 0} 段`);
+  } catch (error) {
+    setSyncState("结构化失败", "is-error");
+    showToast(error.message);
+  }
+  renderPage();
+}
+
+// 庭审小结：本地启发式或可选 Claude 生成（仅依据笔录）。
+async function runHearingSummary() {
+  const caseItem = currentCase();
+  if (!caseItem) return showToast("请先选择案件");
+  const transcript = hearingTranscript?.text || (hearingTranscript?.segments || []).map(item => `${item.speaker ? item.speaker + "：" : ""}${item.text}`).join("\n");
+  if (!transcript?.trim()) return showToast("请先转写或导入庭审笔录");
+  setSyncState("正在生成庭审小结", "is-syncing");
+  try {
+    hearingSummary = await apiRequest("/api/hearing/summary", { method: "POST", body: { caseId: caseItem.id, transcript } });
+    setSyncState("已同步");
+  } catch (error) {
+    hearingSummary = null;
+    setSyncState("生成失败", "is-error");
+    showToast(error.message);
+  }
   renderPage();
 }
 
@@ -756,7 +849,7 @@ function toneForStatus(value) {
 }
 
 function renderCaseSelect() {
-  caseSelect.innerHTML = state.cases.map(item => `<option value="${item.id}" ${item.id === state.activeCaseId ? "selected" : ""}>${escapeHTML(item.title)}</option>`).join("");
+  caseSelect.innerHTML = state.cases.filter(item => !item.archived).map(item => `<option value="${item.id}" ${item.id === state.activeCaseId ? "selected" : ""}>${escapeHTML(item.title)}</option>`).join("");
 }
 
 function deadlineItems() {
@@ -1190,9 +1283,9 @@ function renderCases() {
         </div>
         <div class="dossier-body">${dossierBody}</div>
       </section>` : ""}
-    <div class="section-label"><h2>全部案件</h2><span>${state.cases.length} 件</span></div>
+    <div class="section-label"><h2>全部案件</h2><span>${state.cases.filter(item => !item.archived).length} 件</span></div>
     <div class="case-list">
-      ${state.cases.map(item => {
+      ${state.cases.filter(item => !item.archived).map(item => {
         const remaining = daysUntil(item.nextDate);
         return `<article class="case-card">
           <div><h3>${escapeHTML(item.title)}</h3><p>${escapeHTML(item.caseNo)} · ${escapeHTML(item.court)}</p></div>
@@ -1555,13 +1648,54 @@ function calculateStrategy(caseItem, evidence) {
   };
 }
 
+function outcomeTone(outcome) {
+  return outcome === "支持" ? "green" : outcome === "驳回" ? "red" : "gold";
+}
+
+// 类案检索与裁判倾向面板（服务端模式）。
+function renderTendencyPanel() {
+  if (!apiMode) return "";
+  const head = `<div class="panel-head"><div><h2>类案与裁判倾向</h2><p>样例裁判要旨检索 · 仅供参考</p></div><button class="secondary-button" type="button" data-action="strategy-tendency">检索类案</button></div>`;
+  if (!strategyTendency) {
+    return `<section class="panel"><div class="panel-head"><div><h2>类案与裁判倾向</h2><p>样例裁判要旨检索 · 仅供参考</p></div><button class="primary-button" type="button" data-action="strategy-tendency">检索类案</button></div><div class="panel-body"><div class="empty-state"><strong>尚未检索类案</strong>点击「检索类案」按当前案由与事实召回相似裁判要旨，聚合裁判倾向参考。</div></div></section>`;
+  }
+  const { tendency, precedents, summary, summaryBy } = strategyTendency;
+  const sourceBadge = summaryBy?.startsWith("claude") ? badge("Claude 综述 · 仅依据类案片段", "teal") : badge("本地启发式聚合 · 未经模型生成", "gold");
+  const bar = tendency.total
+    ? `<div class="risk-bar" style="display:flex; overflow:hidden;">
+        <span style="width:${tendency.supportPct}%; background:var(--green);" title="支持 ${tendency.supportPct}%"></span>
+        <span style="width:${tendency.partialPct}%; background:var(--gold);" title="部分支持 ${tendency.partialPct}%"></span>
+        <span style="width:${tendency.dismissPct}%; background:var(--red);" title="驳回 ${tendency.dismissPct}%"></span>
+      </div>
+      <p class="source-line" style="margin-top:10px;">支持 ${tendency.support} · 部分支持 ${tendency.partial} · 驳回 ${tendency.dismiss}（共 ${tendency.total} 件样例类案）</p>`
+    : "";
+  const list = precedents.map(item => `<div style="padding:10px 0; border-bottom:1px solid var(--line);">
+      <div style="display:flex; justify-content:space-between; gap:12px; align-items:center;"><strong style="font-size:13px;">${escapeHTML(item.title)}</strong>${badge(item.outcome, outcomeTone(item.outcome))}</div>
+      <p class="source-line" style="margin:6px 0 4px;">${escapeHTML(item.cause)} · ${escapeHTML(item.court)}${item.year ? ` · ${escapeHTML(item.year)}` : ""}</p>
+      <p style="font-size:12px; color:var(--muted); margin:0;">${escapeHTML(item.gist.slice(0, 140))}${item.gist.length > 140 ? "…" : ""}</p>
+    </div>`).join("") || `<div class="empty-state"><strong>未检索到相似类案样例</strong>可调整案由或事实关键词后重试。</div>`;
+  return `<section class="panel">
+    ${head}
+    <div class="panel-body">
+      ${bar}
+      <p style="font-size:13px; line-height:1.7; margin:12px 0;">${escapeHTML(summary)}</p>
+      <div style="margin-bottom:10px;">${sourceBadge}</div>
+      ${list}
+      <div class="disclaimer" style="margin-top:14px;">裁判倾向基于样例类案统计，仅供参考，不代表胜败概率或确定性结论；正式类案须回到中国裁判文书网核验。</div>
+    </div>
+  </section>`;
+}
+
 function renderStrategy() {
   const caseItem = currentCase();
   if (!caseItem) return `${pageHead()}<div class="empty-state"><strong>暂无案件</strong>请先新建案件。</div>`;
   const evidence = currentEvidence();
   const result = calculateStrategy(caseItem, evidence);
+  const searchButton = apiMode
+    ? `<button class="secondary-button" type="button" data-action="strategy-tendency">检索类案</button>`
+    : `<button class="secondary-button" type="button" data-route="search">检索类案</button>`;
   return `
-    ${pageHead(`<button class="secondary-button" type="button" data-route="search">检索类案</button><button class="primary-button" type="button" data-route="documents">生成策略文书</button>`)}
+    ${pageHead(`${searchButton}<button class="primary-button" type="button" data-route="documents">生成策略文书</button>`)}
     <div class="insight-grid">
       <article class="insight-card"><h3>综合风险参考</h3><div class="risk-score"><strong>${result.score}</strong><span>/ 100 · ${result.level}</span></div><div class="risk-bar"><span style="width:${result.score}%; background:${result.score >= 65 ? "var(--red)" : "var(--gold)"}"></span></div><p class="source-line" style="margin-top:12px;">由证据完整度、节点紧迫性和案件录入情况计算</p></article>
       <article class="insight-card"><h3>争议焦点</h3><ul>${result.disputes.map(item => `<li>${escapeHTML(item)}</li>`).join("")}</ul></article>
@@ -1573,7 +1707,8 @@ function renderStrategy() {
         <div class="workflow">${result.actions.map((item, index) => `<div class="workflow-step"><strong>步骤 ${index + 1}</strong><span>${escapeHTML(item)}</span></div>`).join("")}<div class="workflow-step"><strong>持续校验</strong><span>每次补充证据或节点变化后重新评估策略。</span></div></div>
         <div class="disclaimer" style="margin-top:14px;">风险分值和路径建议仅用于辅助办案，不是胜败概率或确定性法律意见。</div>
       </div>
-    </section>`;
+    </section>
+    ${renderTendencyPanel()}`;
 }
 
 function answerQuestion(query) {
@@ -1631,7 +1766,54 @@ function renderHearing() {
         <div class="panel-head"><div><h2>智能生成提纲</h2><p>基于当前案件与证据目录</p></div></div>
         <textarea id="hearing-editor" class="document-editor" style="min-height:520px;">${escapeHTML(hearingOutline(caseItem))}</textarea>
       </section>
-    </div>`;
+    </div>
+    ${renderTranscriptionPanel(caseItem)}`;
+}
+
+const AUDIO_EXTENSIONS = [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".webm"];
+
+// 庭审语音转写面板（服务端模式）：本地引擎转写音频或手工导入笔录，结构化为分段并可选生成小结。
+function renderTranscriptionPanel(caseItem) {
+  if (!apiMode) return `<section class="panel" style="margin-top:16px;"><div class="panel-head"><div><h2>庭审语音转写</h2><p>本地离线转写 · 数据不出本机</p></div></div><div class="panel-body"><div class="empty-state"><strong>需登录服务端模式</strong>本地演示模式下不提供语音转写与笔录结构化。</div></div></section>`;
+  const caps = hearingCapabilities;
+  const engineBadge = caps?.available ? badge(`本地引擎：${caps.engine}`, "green") : badge("未检测到本地引擎 · 可手工导入笔录", "gold");
+  const audioFiles = caseFiles.filter(item => item.caseId === caseItem.id && AUDIO_EXTENSIONS.some(ext => (item.name || "").toLowerCase().endsWith(ext)));
+  const transcribeBlock = caps?.available
+    ? `<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px;">
+        <select id="transcribe-file" style="flex:1; min-width:200px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--surface); color:inherit;">
+          ${audioFiles.map(item => `<option value="${item.id}">${escapeHTML(item.name)}</option>`).join("") || `<option value="">（当前案件暂无录音文件，请先在「证据管理」上传）</option>`}
+        </select>
+        <button class="primary-button" type="button" data-action="transcribe-audio" ${audioFiles.length ? "" : "disabled"}>转写录音</button>
+      </div>`
+    : `<div class="disclaimer" style="margin:0 0 12px;">未检测到本地语音引擎。可安装 faster-whisper 或配置 <code>HENGFA_ASR_CMD</code> 后离线转写；当前可直接在下方手工导入庭审笔录。</div>`;
+  const segments = hearingTranscript?.segments || [];
+  const segmentsBlock = segments.length
+    ? `<div style="max-height:360px; overflow:auto; margin-top:6px;">${segments.map(item => `<div style="padding:8px 0; border-bottom:1px solid var(--line);">
+        <div class="case-meta" style="margin-bottom:2px;">${item.time ? badge(item.time, "teal") : ""}${item.speaker ? `<strong>${escapeHTML(item.speaker)}</strong>` : ""}</div>
+        <span style="font-size:13px;">${escapeHTML(item.text)}</span>
+      </div>`).join("")}</div>
+      <div style="margin-top:10px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">${badge(`${segments.length} 段`, "blue")}${hearingTranscript?.method ? badge(`来源：${hearingTranscript.method === "import" ? "导入笔录" : hearingTranscript.method}`, "gold") : ""}<button class="secondary-button" type="button" data-action="hearing-summary">生成庭审小结</button></div>`
+    : `<div class="empty-state" style="margin-top:6px;"><strong>暂无笔录</strong>转写录音或导入笔录后在此显示分段。</div>`;
+  const summaryBlock = hearingSummary
+    ? `<div style="margin-top:14px; padding-top:12px; border-top:1px solid var(--line);">
+        <div style="margin-bottom:8px;">${hearingSummary.summaryBy?.startsWith("claude") ? badge("Claude 生成 · 仅依据笔录", "teal") : badge("本地启发式摘录 · 未经模型生成", "gold")}</div>
+        <p style="font-size:13px; line-height:1.7; white-space:pre-wrap; margin:0;">${escapeHTML(hearingSummary.summary)}</p>
+      </div>`
+    : "";
+  return `<section class="panel" style="margin-top:16px;">
+    <div class="panel-head"><div><h2>庭审语音转写</h2><p>本地离线转写 · 数据不出本机</p></div>${engineBadge}</div>
+    <div class="panel-body">
+      ${transcribeBlock}
+      <details>
+        <summary style="cursor:pointer; font-size:13px; color:var(--muted); margin-bottom:8px;">手工导入庭审笔录（支持 SRT / VTT /「说话人：内容」/ 纯文本）</summary>
+        <textarea id="transcript-import" placeholder="粘贴庭审笔录文本，例如：\n审判长：现在开庭。\n原告代理人：对该证据真实性无异议。" style="width:100%; min-height:120px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--surface); color:inherit;"></textarea>
+        <div style="margin-top:8px;"><button class="secondary-button" type="button" data-action="import-transcript">结构化导入</button></div>
+      </details>
+      ${segmentsBlock}
+      ${summaryBlock}
+      <div class="disclaimer" style="margin-top:14px;">转写与小结仅为庭后整理辅助，须结合完整笔录与录音核验；音频与笔录均在本机处理（小结如启用 Claude 才会发送笔录文本）。</div>
+    </div>
+  </section>`;
 }
 
 function renderExecution() {
@@ -1651,14 +1833,61 @@ function renderExecution() {
     </section>`;
 }
 
+// 案源 / 客户管理面板（工作区级，存于同步状态）。
+function renderClientsPanel() {
+  const clients = state.clients || [];
+  const canEdit = can("manage_tasks");
+  const cols = canEdit ? 6 : 5;
+  return `<section class="panel" style="margin-top:16px;">
+    <div class="panel-head"><div><h2>案源 / 客户</h2><p>客户与案源渠道管理 · ${clients.length} 位</p></div>${canEdit ? `<button class="primary-button" type="button" data-action="add-client">＋ 新增客户</button>` : ""}</div>
+    <div class="data-table-wrap"><table class="data-table">
+      <thead><tr><th>客户</th><th>联系方式</th><th>案源渠道</th><th>关联案件</th><th>备注</th>${canEdit ? "<th>操作</th>" : ""}</tr></thead>
+      <tbody>${clients.map(item => {
+        const linked = (item.caseIds || []).map(caseId => state.cases.find(caseEntry => caseEntry.id === caseId)?.title).filter(Boolean);
+        return `<tr><td><strong>${escapeHTML(item.name)}</strong></td><td>${escapeHTML(item.contact || "—")}</td><td>${item.channel ? badge(item.channel, "teal") : "—"}</td><td>${linked.length ? escapeHTML(linked.join("、")) : badge(`${(item.caseIds || []).length} 件`, "blue")}</td><td>${escapeHTML(item.note || "")}</td>${canEdit ? `<td><button class="quiet-button" type="button" data-action="edit-client" data-id="${item.id}">编辑</button><button class="quiet-button" type="button" data-action="delete-client" data-id="${item.id}">删除</button></td>` : ""}</tr>`;
+      }).join("") || `<tr><td colspan="${cols}"><div class="empty-state"><strong>暂无客户</strong>登记案源与客户信息便于跟进与归档检索。</div></td></tr>`}</tbody>
+    </table></div>
+  </section>`;
+}
+
+// 归档案件检索结果列表（独立函数，便于按关键词即时刷新而不丢失输入焦点）。
+function archiveResultsHTML() {
+  const archived = state.cases.filter(item => item.archived);
+  const query = archiveQuery.trim().toLowerCase();
+  const matched = query
+    ? archived.filter(item => `${item.title} ${item.caseNo} ${item.client} ${item.cause} ${item.facts || ""}`.toLowerCase().includes(query))
+    : archived;
+  return matched.map(item => `<div style="display:flex; justify-content:space-between; gap:12px; align-items:center; padding:10px 0; border-bottom:1px solid var(--line);">
+      <div class="case-meta"><strong>${escapeHTML(item.title)}</strong><span>${escapeHTML(item.caseNo)} · ${escapeHTML(item.client)} · ${escapeHTML(item.cause)}${item.archivedAt ? ` · 归档于 ${formatDate(item.archivedAt)}` : ""}</span></div>
+      <div style="display:flex; gap:8px;"><button class="quiet-button" type="button" data-action="set-case" data-id="${item.id}">打开</button>${can("edit_case") ? `<button class="quiet-button" type="button" data-action="toggle-archive" data-id="${item.id}">取消归档</button>` : ""}</div>
+    </div>`).join("") || `<div class="empty-state"><strong>${archived.length ? "未匹配到归档案件" : "暂无归档案件"}</strong>${archived.length ? "调整检索关键词后重试。" : "在本页头部点击「归档当前案件」即可归档。"}</div>`;
+}
+
+// 归档检索面板（工作区级）。
+function renderArchivePanel() {
+  const archivedCount = state.cases.filter(item => item.archived).length;
+  return `<section class="panel" style="margin-top:16px;">
+    <div class="panel-head"><div><h2>归档检索</h2><p>已归档案件 ${archivedCount} 件</p></div></div>
+    <div class="panel-body">
+      <input id="archive-search" type="search" value="${escapeHTML(archiveQuery)}" placeholder="按案件名称 / 案号 / 当事人 / 案由检索归档案件" aria-label="归档检索" style="width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--surface); color:inherit;">
+      <div id="archive-results" style="margin-top:12px;">${archiveResultsHTML()}</div>
+    </div>
+  </section>`;
+}
+
 function renderCollaboration() {
   const caseItem = currentCase();
   const tasks = state.tasks.filter(item => item.caseId === caseItem?.id);
   const timeLogs = state.timeLogs.filter(item => item.caseId === caseItem?.id);
   const versions = state.documentVersions.filter(item => item.caseId === caseItem?.id);
   const totalHours = timeLogs.reduce((sum, item) => sum + Number(item.hours), 0);
+  const actions = [
+    caseItem && can("edit_case") ? `<button class="secondary-button" type="button" data-action="toggle-archive" data-id="${caseItem.id}">${caseItem.archived ? "取消归档" : "归档当前案件"}</button>` : "",
+    can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-time">登记工时</button>` : "",
+    can("manage_tasks") ? `<button class="primary-button" type="button" data-action="add-task">＋ 新建任务</button>` : ""
+  ].join("");
   return `
-    ${pageHead(can("manage_tasks") ? `<button class="secondary-button" type="button" data-action="add-time">登记工时</button><button class="primary-button" type="button" data-action="add-task">＋ 新建任务</button>` : "")}
+    ${pageHead(actions)}
     <div class="dashboard-grid">
       <section class="panel">
         <div class="panel-head"><div><h2>案件任务</h2><p>${tasks.filter(item => !item.done).length} 项未完成</p></div></div>
@@ -1677,14 +1906,16 @@ function renderCollaboration() {
           <div class="panel-body">${versions.map(item => `<div style="display:flex; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px solid var(--line);"><div class="case-meta"><strong>${escapeHTML(item.name)} ${escapeHTML(item.version)}</strong><span>${escapeHTML(item.member)} · ${formatDate(item.updatedAt)}</span></div>${badge("已留痕", "blue")}</div>`).join("") || `<div class="empty-state"><strong>暂无版本</strong>下载文书后会生成版本记录。</div>`}</div>
         </section>
       </div>
-    </div>`;
+    </div>
+    ${renderClientsPanel()}
+    ${renderArchivePanel()}`;
 }
 
 function renderPlatform() {
   const layers = [
-    ["01", "用户交互层", "Web 工作台、桌面端、移动端、Word/WPS 插件与对话入口", "已实现 Web MVP"],
+    ["01", "用户交互层", "Web 工作台、桌面端、移动端、Word/WPS 插件与对话入口", "Web + Word/WPS 插件"],
     ["02", "应用服务层", "案件、文书、权限协作、工时计费与业务 API", "本地服务模拟"],
-    ["03", "AI 能力中台", "法律模型、RAG 检索、Agent 编排、意图识别与结果校验", "接口待接入"],
+    ["03", "AI 能力中台", "法律模型、RAG 检索、Agent 编排、意图识别与结果校验", "Claude 基座可选接入"],
     ["04", "知识与数据层", "法条、司法解释、案例、案件档案与向量索引", "样例知识库"],
     ["05", "基础设施层", "身份认证、存储、日志审计、加密与私有化部署", "本地存储"],
   ];
@@ -1949,6 +2180,18 @@ function timeForm() {
       <div class="form-field"><label>日期</label><input name="date" type="date" required value="${dateFromNow(0)}"></div>
       <div class="form-field"><label>工作事项</label><input name="activity" required placeholder="例如：证据审查"></div>
     </div>`, "time-form");
+}
+
+function clientForm(client = {}) {
+  openDialog(client.id ? "编辑客户" : "新增客户", `
+    <input type="hidden" name="id" value="${escapeHTML(client.id || "")}">
+    <div class="form-grid">
+      <div class="form-field"><label>客户名称</label><input name="name" required value="${escapeHTML(client.name || "")}"></div>
+      <div class="form-field"><label>联系方式</label><input name="contact" value="${escapeHTML(client.contact || "")}" placeholder="电话 / 邮箱"></div>
+      <div class="form-field full"><label>案源渠道</label><input name="channel" value="${escapeHTML(client.channel || "")}" placeholder="如：老客户转介绍 / 线上咨询 / 合作律所推荐"></div>
+      <div class="form-field full"><label>关联案件（可多选）</label><select name="caseIds" multiple size="3">${state.cases.map(item => `<option value="${item.id}" ${(client.caseIds || []).includes(item.id) ? "selected" : ""}>${escapeHTML(item.title)}</option>`).join("")}</select></div>
+      <div class="form-field full"><label>备注</label><textarea name="note">${escapeHTML(client.note || "")}</textarea></div>
+    </div>`, "client-form");
 }
 
 function clueForm() {
@@ -2245,6 +2488,24 @@ function saveClue(form) {
   showToast("财产线索已保存");
 }
 
+function saveClient(form) {
+  const data = formDataObject(form);
+  const caseIds = new FormData(form).getAll("caseIds");
+  const fields = { name: data.name, contact: data.contact || "", channel: data.channel || "", note: data.note || "", caseIds };
+  state.clients = state.clients || [];
+  if (data.id) {
+    const existing = state.clients.find(item => item.id === data.id);
+    if (existing) Object.assign(existing, fields);
+  } else {
+    state.clients.push({ id: uid("client"), ...fields, createdAt: dateFromNow(0) });
+  }
+  recordAudit(data.id ? "客户更新" : "客户新增", data.name);
+  persist();
+  dialog.close();
+  renderPage();
+  showToast("客户信息已保存");
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -2361,6 +2622,10 @@ document.addEventListener("click", async event => {
     "add-task": "manage_tasks",
     "add-time": "manage_tasks",
     "toggle-task": "manage_tasks",
+    "add-client": "manage_tasks",
+    "edit-client": "manage_tasks",
+    "delete-client": "manage_tasks",
+    "toggle-archive": "edit_case",
     "select-template": "export_documents",
     "refresh-document": "export_documents",
     "copy-document": "export_documents",
@@ -2368,6 +2633,9 @@ document.addEventListener("click", async event => {
     "save-version": "export_documents",
     "compare-versions": "export_documents",
     "extract-facts": "export_documents",
+    "transcribe-audio": "export_documents",
+    "import-transcript": "export_documents",
+    "hearing-summary": "export_documents",
     "copy-hearing": "export_documents",
     "download-hearing": "export_documents",
     "add-user": "manage_users",
@@ -2447,6 +2715,29 @@ document.addEventListener("click", async event => {
   if (action === "add-task") taskForm();
   if (action === "add-time") timeForm();
   if (action === "add-clue") clueForm();
+  if (action === "add-client") clientForm();
+  if (action === "edit-client") clientForm((state.clients || []).find(item => item.id === button.dataset.id));
+  if (action === "delete-client") {
+    state.clients = (state.clients || []).filter(item => item.id !== button.dataset.id);
+    persist();
+    renderPage();
+    showToast("客户已删除");
+  }
+  if (action === "toggle-archive") {
+    const target = state.cases.find(item => item.id === button.dataset.id);
+    if (target) {
+      target.archived = !target.archived;
+      target.archivedAt = target.archived ? dateFromNow(0) : "";
+      if (target.archived && state.activeCaseId === target.id) {
+        state.activeCaseId = state.cases.find(item => !item.archived)?.id || target.id;
+      }
+      recordAudit(target.archived ? "案件归档" : "取消归档", target.title, target.id);
+      persist();
+      renderCaseSelect();
+      renderPage();
+      showToast(target.archived ? "案件已归档" : "已取消归档");
+    }
+  }
   if (action === "add-user") userForm();
   if (action === "edit-user") {
     const user = workspaceUsers.find(item => item.id === button.dataset.id);
@@ -2499,6 +2790,9 @@ document.addEventListener("click", async event => {
     documentReviewResults = [];
     documentFacts = null;
     documentVerification = null;
+    strategyTendency = null;
+    hearingTranscript = null;
+    hearingSummary = null;
     persist();
     renderCaseSelect();
     renderPage();
@@ -2511,6 +2805,9 @@ document.addEventListener("click", async event => {
     documentReviewResults = [];
     documentFacts = null;
     documentVerification = null;
+    strategyTendency = null;
+    hearingTranscript = null;
+    hearingSummary = null;
     persist();
     renderCaseSelect();
     renderPage();
@@ -2557,6 +2854,10 @@ document.addEventListener("click", async event => {
     showToast("文书已重新生成");
   }
   if (action === "extract-facts") runFactExtraction();
+  if (action === "strategy-tendency") runStrategyTendency();
+  if (action === "transcribe-audio") runTranscribe(document.querySelector("#transcribe-file")?.value || "");
+  if (action === "import-transcript") runImportTranscript(document.querySelector("#transcript-import")?.value || "");
+  if (action === "hearing-summary") runHearingSummary();
   if (action === "timeline-to-events") {
     if (!can("edit_case") && !can("manage_tasks")) return showToast("当前角色无权修改案件节点");
     const caseId = state.activeCaseId;
@@ -2793,6 +3094,7 @@ document.addEventListener("submit", event => {
   if (event.target.id === "task-form") saveTask(event.target);
   if (event.target.id === "time-form") saveTime(event.target);
   if (event.target.id === "clue-form") saveClue(event.target);
+  if (event.target.id === "client-form") saveClient(event.target);
 });
 
 document.addEventListener("input", event => {
@@ -2804,6 +3106,11 @@ document.addEventListener("input", event => {
   }
   if (event.target.id === "deadline-service-date" || event.target.id === "deadline-days") renderDeadlineResult();
   if (event.target.id === "batch-service-date" || /^batch-\w+-days$/.test(event.target.id)) renderBatchRows();
+  if (event.target.id === "archive-search") {
+    archiveQuery = event.target.value;
+    const container = document.querySelector("#archive-results");
+    if (container) container.innerHTML = archiveResultsHTML();
+  }
 });
 
 document.addEventListener("change", event => {
@@ -2813,6 +3120,9 @@ document.addEventListener("change", event => {
     documentReviewResults = [];
     documentFacts = null;
     documentVerification = null;
+    strategyTendency = null;
+    hearingTranscript = null;
+    hearingSummary = null;
     persist();
     renderPage();
   }

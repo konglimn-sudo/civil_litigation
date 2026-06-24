@@ -6,8 +6,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDatabase } from "./db.mjs";
 import { legalCorpus } from "./legal-corpus.mjs";
+import { precedentCorpus } from "./precedent-corpus.mjs";
 import { defaultHolidayCalendars } from "./holidays.mjs";
 import { extractTextLocally, localExtractionCapabilities } from "./ocr.mjs";
+import { transcriptionCapabilities, transcribeAudioLocally, parseTranscript } from "./transcribe.mjs";
+import { renderDocumentTemplate, templateLabels } from "./document-templates.mjs";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const host = "127.0.0.1";
@@ -19,8 +22,9 @@ const sessionHours = 8;
 const bodyLimit = 3 * 1024 * 1024;
 const fileLimit = 25 * 1024 * 1024;
 
-// 可选 LLM provider：默认关闭（本地优先）。设 HENGFA_LLM=claude 且配置 ANTHROPIC_API_KEY 后，
-// /api/legal/answer 改为基于检索片段的生成式回答并强制附引用；任何异常都回退到抽取式。
+// AI 能力中台基座模型：本系统统一指定 Claude 为生成式基座，但默认关闭（本地优先）。
+// 设 HENGFA_LLM=claude 且配置 ANTHROPIC_API_KEY 后，问答 / 事实抽取 / 裁判倾向综述改为
+// 以检索片段或案件材料为唯一依据的 Claude 生成并强制附引用；任何异常都回退到本地结果。
 const llmProvider = (process.env.HENGFA_LLM || "none").toLowerCase();
 const llmModel = process.env.HENGFA_LLM_MODEL || "claude-opus-4-8";
 const llmApiKey = process.env.ANTHROPIC_API_KEY || "";
@@ -31,7 +35,10 @@ const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
-  ".pdf": "application/pdf"
+  ".pdf": "application/pdf",
+  ".xml": "text/xml; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml"
 };
 
 const rolePermissions = {
@@ -152,6 +159,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_case_files_case ON case_files(workspace_id, case_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_legal_sources_workspace ON legal_sources(workspace_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_legal_revisions_source ON legal_source_revisions(source_id, changed_at DESC);
+  CREATE TABLE IF NOT EXISTS precedents (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    court TEXT NOT NULL,
+    cause TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    year TEXT,
+    title TEXT NOT NULL,
+    gist TEXT NOT NULL,
+    source_url TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE VIRTUAL TABLE IF NOT EXISTS precedent_fts USING fts5(
+    precedent_id UNINDEXED,
+    search_text,
+    content UNINDEXED
+  );
+  CREATE INDEX IF NOT EXISTS idx_precedents_workspace ON precedents(workspace_id, created_at DESC);
   CREATE TABLE IF NOT EXISTS notifications (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -235,6 +260,7 @@ function seedDatabase() {
     if (!process.env.HENGFA_ADMIN_PASSWORD) console.log("Initial password: Hengfa-Admin-2026 (change it after login)");
   }
   seedLegalCorpus(workspaceId, now);
+  seedPrecedents(workspaceId, now);
   seedHolidays(workspaceId, now);
 }
 
@@ -474,6 +500,20 @@ function seedLegalCorpus(workspaceId, now) {
   console.log(`Seeded ${legalCorpus.length} sample legal sources.`);
 }
 
+function seedPrecedents(workspaceId, now) {
+  const existing = Number(db.prepare("SELECT COUNT(*) AS count FROM precedents WHERE workspace_id = ?").get(workspaceId).count);
+  if (existing) return;
+  const insert = db.prepare(`INSERT OR IGNORE INTO precedents
+    (id, workspace_id, court, cause, outcome, year, title, gist, source_url, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?)`);
+  for (const item of precedentCorpus) {
+    const precedentId = `prec_seed_${item.id}`;
+    insert.run(precedentId, workspaceId, item.court, item.cause, item.outcome, item.year || "", item.title, item.gist, now);
+    indexPrecedent(precedentId, `${item.cause}。${item.title}。${(item.tags || []).join(" ")}。${item.gist}`);
+  }
+  console.log(`Seeded ${precedentCorpus.length} sample precedents.`);
+}
+
 seedDatabase();
 db.prepare("DELETE FROM sessions WHERE expires_at <= ?").run(isoNow());
 
@@ -636,7 +676,7 @@ function publicCaseFile(row, includeText = false) {
   return result;
 }
 
-const allowedFileExtensions = new Set([".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"]);
+const allowedFileExtensions = new Set([".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".webm"]);
 
 let pythonExtractorReady = null;
 
@@ -725,6 +765,13 @@ function indexLegalSource(sourceId, text) {
   return chunks.length;
 }
 
+// 类案裁判要旨入库索引（单条要旨作为一个 chunk）。
+function indexPrecedent(precedentId, text) {
+  db.prepare("DELETE FROM precedent_fts WHERE precedent_id = ?").run(precedentId);
+  db.prepare("INSERT INTO precedent_fts (precedent_id, search_text, content) VALUES (?, ?, ?)")
+    .run(precedentId, legalSearchTokens(text).join(" "), text);
+}
+
 // 记录法源字段变更留痕(创建、效力状态变更等)。
 function recordLegalRevision(sourceId, workspaceId, field, oldValue, newValue, userId) {
   db.prepare(`INSERT INTO legal_source_revisions (id, source_id, workspace_id, field, old_value, new_value, changed_by, changed_at)
@@ -764,28 +811,122 @@ function searchLegalSources(workspaceId, query, limit = 8, { includeLapsed = fal
     }));
 }
 
+// 类案检索：按 BM25 召回最相似的裁判要旨。
+function searchPrecedents(workspaceId, query, limit = 8) {
+  const tokens = legalSearchTokens(query);
+  if (!tokens.length) return [];
+  const match = tokens.map(token => `"${token.replaceAll('"', '""')}"`).join(" OR ");
+  return db.prepare(`SELECT precedents.id, precedents.court, precedents.cause, precedents.outcome,
+      precedents.year, precedents.title, precedents.gist, precedents.source_url, bm25(precedent_fts) AS rank
+    FROM precedent_fts JOIN precedents ON precedents.id = precedent_fts.precedent_id
+    WHERE precedent_fts MATCH ? AND precedents.workspace_id = ?
+    ORDER BY rank LIMIT ?`).all(match, workspaceId, Math.max(1, Math.min(Number(limit) || 8, 20))).map(row => ({
+      id: row.id,
+      court: row.court,
+      cause: row.cause,
+      outcome: row.outcome,
+      year: row.year,
+      title: row.title,
+      gist: row.gist,
+      sourceUrl: row.source_url,
+      score: Number((-row.rank).toFixed(4))
+    }));
+}
+
+// 本地启发式裁判倾向聚合：统计召回类案中支持 / 部分支持 / 驳回的占比（仅供参考）。
+function tendencyFromPrecedents(results) {
+  const buckets = { 支持: 0, 部分支持: 0, 驳回: 0 };
+  for (const item of results) if (item.outcome in buckets) buckets[item.outcome] += 1;
+  const total = buckets.支持 + buckets.部分支持 + buckets.驳回;
+  const pct = value => (total ? Math.round((value / total) * 100) : 0);
+  const lead = total
+    ? Object.entries(buckets).sort((a, b) => b[1] - a[1])[0][0]
+    : null;
+  return {
+    total,
+    support: buckets.支持,
+    partial: buckets.部分支持,
+    dismiss: buckets.驳回,
+    supportPct: pct(buckets.支持),
+    partialPct: pct(buckets.部分支持),
+    dismissPct: pct(buckets.驳回),
+    lead
+  };
+}
+
+// 可选 Claude 类案综述：仅依据召回的裁判要旨片段，强制附「（依据：类案N）」，异常由调用方回退。
+async function claudePrecedentSummary(query, results) {
+  const context = results.map((item, index) => `【类案${index + 1}｜${item.cause}｜${item.court}｜结果：${item.outcome}】\n${item.title}。${item.gist}`).join("\n\n");
+  const system = "你是中国民事诉讼类案分析助理。只能依据下面提供的【类案裁判要旨】综述裁判倾向与影响裁判的关键因素，不得引用片段之外的案例、法条或数字，不得编造。每个结论后用「（依据：类案N）」标注来源。须明确指出这是基于样例类案的倾向参考、并非胜败概率或确定性意见，结尾提示应回到正式裁判文书库核验。用简洁、可操作的中文回答。";
+  return claudeChat({ system, user: `当前案件检索语：${query}\n\n召回的类案裁判要旨：\n${context}`, maxTokens: 900 });
+}
+
+// 类案倾向的本地综述（不调用模型）。
+function localTendencySummary(tendency, results) {
+  if (!tendency.total) return "未检索到相似类案样例。可调整案由或关键事实关键词后重试，或由管理员导入更多类案。";
+  const parts = [`在 ${tendency.total} 件相似类案样例中，支持 ${tendency.support} 件（${tendency.supportPct}%）、部分支持 ${tendency.partial} 件（${tendency.partialPct}%）、驳回 ${tendency.dismiss} 件（${tendency.dismissPct}%）。`];
+  if (tendency.lead) parts.push(`倾向以「${tendency.lead}」居多。`);
+  const dismiss = results.find(item => item.outcome === "驳回");
+  if (dismiss) parts.push(`需重点关注被驳回类案的风险点：${dismiss.title}。`);
+  parts.push("以上为样例类案的倾向参考，不代表胜败概率或确定性结论，须回到正式裁判文书库核验。");
+  return parts.join("");
+}
+
+const HEARING_KEYWORDS = /自认|承认|认可|无异议|有异议|不认可|不予认可|否认|质证|争议焦点|当庭|和解|调解|举证|鉴定|管辖|陈述/;
+
+// 本地启发式庭审小结（不调用模型）：统计发言并摘录自认/异议/质证等关键发言。
+function localHearingSummary(transcript) {
+  const segments = parseTranscript(transcript);
+  if (!segments.length) return "未解析到有效庭审笔录内容。导入文本支持 SRT / VTT /「说话人：内容」/ 纯文本格式。";
+  const speakers = [...new Set(segments.map(item => item.speaker).filter(Boolean))];
+  const keyPoints = segments.filter(item => HEARING_KEYWORDS.test(item.text)).slice(0, 8);
+  const lines = [`本庭审笔录共 ${segments.length} 段${speakers.length ? `，发言主体：${speakers.join("、")}` : ""}。`];
+  if (keyPoints.length) {
+    lines.push("关注要点（自认 / 异议 / 质证 / 争议等关键发言摘录）：");
+    keyPoints.forEach((item, index) => lines.push(`${index + 1}. ${item.speaker ? item.speaker + "：" : ""}${item.text.slice(0, 80)}${item.text.length > 80 ? "…" : ""}${item.time ? `（${item.time}）` : ""}`));
+  } else {
+    lines.push("未自动识别到自认 / 异议 / 质证等关键发言，请人工通读笔录确认。");
+  }
+  lines.push("以上为本地启发式摘录，仅供庭后整理参考，须结合完整笔录与录音核验。");
+  return lines.join("\n");
+}
+
+// 可选 Claude 庭审小结：仅依据庭审发言，强制附「（依据：发言N）」，异常由调用方回退。
+async function claudeHearingSummary(caseItem, transcript) {
+  const segments = parseTranscript(transcript);
+  const context = segments.map((item, index) => `【发言${index + 1}${item.time ? `｜${item.time}` : ""}${item.speaker ? `｜${item.speaker}` : ""}】${item.text}`).join("\n").slice(0, 16000);
+  const system = "你是中国民事诉讼庭审记录分析助理。只能依据下面提供的【庭审发言】归纳，不得引用发言之外的信息或编造。请分四部分输出：一、争议焦点；二、各方自认/不利陈述；三、质证与证据意见；四、待跟进事项。每个结论后用「（依据：发言N）」标注来源；信息不足处应明确说明。结尾提示须结合完整笔录与录音核验。用简洁中文回答。";
+  return claudeChat({ system, user: `案件：${caseItem?.title || ""}\n\n庭审发言：\n${context}`, maxTokens: 1200 });
+}
+
 // 抽取式回答：按相关度摘录检索片段，不做生成，避免编造。
 function extractiveAnswer(results) {
   if (!results.length) return "当前正式法源库中未检索到可靠依据。请补充关键词或由管理员导入经核验的法源后重试。";
   return `检索到 ${results.length} 个相关法源片段。以下内容仅按相关度摘录，应结合完整条文、效力状态和案件事实核验：\n\n${results.slice(0, 3).map((item, index) => `${index + 1}. ${item.content.slice(0, 320)}`).join("\n\n")}`;
 }
 
-// 可选 Claude 生成式回答：仅以检索片段为依据，强制附「（依据：片段N）」，异常由调用方回退。
-async function claudeAnswer(query, results) {
-  const context = results.map((item, index) => `【片段${index + 1}｜${item.title}｜${item.authority}｜${item.status}】\n${item.content}`).join("\n\n");
-  const system = "你是中国民事诉讼法律检索助理。只能依据下面提供的【检索片段】作答，不得引用片段之外的法条、案例或数字，不得编造。每个结论后用「（依据：片段N）」标注来源；片段不足以回答时应明确说明并建议核验正式法源。用简洁、可操作的中文回答，并在结尾提示最终须由办案人员核验现行条文与效力状态。";
-  const userMessage = `问题：${query}\n\n可用检索片段：\n${context}`;
+// 统一 Claude 基座客户端：所有生成式能力共用此入口。仅在基座启用时可调用，
+// 任何网络/状态/空内容异常都抛出，由各调用方 catch 并回退到本地结果。
+async function claudeChat({ system, user, maxTokens = 1024, timeout = 40000 }) {
+  if (!llmEnabled) throw new Error("Claude 基座未启用");
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "content-type": "application/json", "x-api-key": llmApiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: llmModel, max_tokens: 1024, system, messages: [{ role: "user", content: userMessage }] }),
-    signal: AbortSignal.timeout(40000)
+    body: JSON.stringify({ model: llmModel, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] }),
+    signal: AbortSignal.timeout(timeout)
   });
   if (!response.ok) throw new Error(`Claude API ${response.status}: ${(await response.text().catch(() => "")).slice(0, 200)}`);
   const data = await response.json();
   const text = (data.content || []).filter(part => part.type === "text").map(part => part.text).join("").trim();
   if (!text) throw new Error("Claude 返回空内容");
   return text;
+}
+
+// 可选 Claude 生成式回答：仅以检索片段为依据，强制附「（依据：片段N）」，异常由调用方回退。
+async function claudeAnswer(query, results) {
+  const context = results.map((item, index) => `【片段${index + 1}｜${item.title}｜${item.authority}｜${item.status}】\n${item.content}`).join("\n\n");
+  const system = "你是中国民事诉讼法律检索助理。只能依据下面提供的【检索片段】作答，不得引用片段之外的法条、案例或数字，不得编造。每个结论后用「（依据：片段N）」标注来源；片段不足以回答时应明确说明并建议核验正式法源。用简洁、可操作的中文回答，并在结尾提示最终须由办案人员核验现行条文与效力状态。";
+  return claudeChat({ system, user: `问题：${query}\n\n可用检索片段：\n${context}`, maxTokens: 1024 });
 }
 
 // —— 文书 Agent：事实抽取与引用校验（纯函数，便于单测）——
@@ -908,15 +1049,7 @@ async function claudeExtractFacts(caseItem, caseTexts) {
   const context = caseTexts.map(file => `【${file.name}】\n${file.text.slice(0, 4000)}`).join("\n\n").slice(0, 16000);
   const system = "你是中国民事诉讼案件事实抽取助理。只能依据提供的【案件材料】抽取客观要件事实，不得编造或加入材料之外的信息。仅输出 JSON 数组，每个元素为 {\"fact\":\"一句客观事实\",\"source\":\"来源文件名\",\"types\":[\"时间\"|\"金额\"|\"当事人\"|\"权利义务\"]}，聚焦时间、金额、交付/付款/违约/履行等要件，最多 20 条。";
   const userMessage = `案件：${caseItem?.title || ""}\n当事人：${caseItem?.client || ""} / ${caseItem?.opposingParty || ""}\n\n案件材料：\n${context}\n\n请输出 JSON 数组。`;
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": llmApiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: llmModel, max_tokens: 1500, system, messages: [{ role: "user", content: userMessage }] }),
-    signal: AbortSignal.timeout(40000)
-  });
-  if (!response.ok) throw new Error(`Claude API ${response.status}`);
-  const data = await response.json();
-  const text = (data.content || []).filter(part => part.type === "text").map(part => part.text).join("");
+  const text = await claudeChat({ system, user: userMessage, maxTokens: 1500 });
   const parsed = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] || "[]");
   return parsed.filter(item => item && item.fact).slice(0, 20).map(item => ({
     fact: String(item.fact).slice(0, 220),
@@ -1060,6 +1193,10 @@ async function handleApi(request, response, url) {
       localOnly: true,
       maxFileSize: fileLimit
     });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/hearing/capabilities") {
+    return sendJson(response, 200, { ...transcriptionCapabilities(), llmSummary: llmEnabled, maxFileSize: fileLimit });
   }
 
   if (request.method === "GET" && url.pathname === "/api/files") {
@@ -1316,6 +1453,75 @@ async function handleApi(request, response, url) {
     });
   }
 
+  // 案情策略：类案检索 + 裁判倾向参考（FTS 召回 + 本地启发式聚合 + 可选 Claude 综述）。
+  if (request.method === "POST" && url.pathname === "/api/strategy/tendency") {
+    if (!requireCsrf(request, response, auth)) return;
+    const body = await readJson(request);
+    const caseId = String(body.caseId || "");
+    if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
+    const state = workspaceState(auth.user.workspaceId);
+    const caseItem = (state.cases || []).find(item => item.id === caseId) || null;
+    const query = String(body.query || [caseItem?.cause, caseItem?.title, caseItem?.claims, caseItem?.facts].filter(Boolean).join(" ")).trim();
+    const precedents = searchPrecedents(auth.user.workspaceId, query, 8);
+    const tendency = tendencyFromPrecedents(precedents);
+    let summary = localTendencySummary(tendency, precedents);
+    let summaryBy = "heuristic";
+    if (llmEnabled && precedents.length) {
+      try { summary = await claudePrecedentSummary(query, precedents); summaryBy = `claude:${llmModel}`; }
+      catch (error) { console.error("LLM tendency summary failed, using heuristic:", error.message); summaryBy = "heuristic-fallback"; }
+    }
+    audit(auth, "类案倾向分析", `${caseItem?.title || caseId} · ${precedents.length} 件类案 · ${summaryBy}`, request);
+    return sendJson(response, 200, { precedents, tendency, summary, summaryBy, query });
+  }
+
+  // 庭审语音转写：转写已上传音频文件，或结构化导入的庭审笔录文本。
+  if (request.method === "POST" && url.pathname === "/api/hearing/transcribe") {
+    if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "export_documents")) return;
+    const body = await readJson(request);
+    const caseId = String(body.caseId || "");
+    if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
+    // 文本导入路径：零依赖结构化，本地演示与无引擎时同样可用。
+    if (body.text != null) {
+      const segments = parseTranscript(String(body.text));
+      audit(auth, "庭审笔录导入", `${caseId} · ${segments.length} 段`, request);
+      return sendJson(response, 200, { method: "import", status: "processed", segments, text: String(body.text) });
+    }
+    // 音频转写路径：调用本地引擎，无引擎时返回 manual 提示手工导入。
+    const fileId = String(body.fileId || "");
+    const row = db.prepare("SELECT * FROM case_files WHERE id = ? AND workspace_id = ?").get(fileId, auth.user.workspaceId);
+    if (!row || !canAccessCase(auth, row.case_id)) return sendError(response, 404, "音频文件不存在或无访问权限", "FILE_NOT_FOUND");
+    const filePath = path.join(uploadsDir, row.stored_name);
+    if (!existsSync(filePath)) return sendError(response, 404, "音频内容已丢失", "FILE_CONTENT_MISSING");
+    const result = transcribeAudioLocally(filePath);
+    // 转写成功时回写到 case_files.extracted_text，使笔录纳入检索与事实抽取。
+    if (result.status === "processed" || result.status === "partial") {
+      db.prepare("UPDATE case_files SET extracted_text = ?, extraction_method = ?, status = ?, processed_at = ? WHERE id = ? AND workspace_id = ?")
+        .run(result.text, `transcript:${result.method}`, result.status, isoNow(), row.id, auth.user.workspaceId);
+    }
+    audit(auth, "庭审语音转写", `${row.original_name} · ${result.method} · ${result.status}`, request);
+    return sendJson(response, 200, { method: result.method, status: result.status, segments: result.segments, text: result.text, error: result.error });
+  }
+
+  // 庭审小结：本地启发式摘录，可选 Claude 生成（仅依据笔录、强制引用，失败回退）。
+  if (request.method === "POST" && url.pathname === "/api/hearing/summary") {
+    if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "export_documents")) return;
+    const body = await readJson(request);
+    const caseId = String(body.caseId || "");
+    if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
+    const transcript = String(body.transcript || "").trim();
+    if (!transcript) return sendError(response, 400, "请先提供庭审笔录", "TRANSCRIPT_REQUIRED");
+    const state = workspaceState(auth.user.workspaceId);
+    const caseItem = (state.cases || []).find(item => item.id === caseId) || null;
+    let summary = localHearingSummary(transcript);
+    let summaryBy = "heuristic";
+    if (llmEnabled) {
+      try { summary = await claudeHearingSummary(caseItem, transcript); summaryBy = `claude:${llmModel}`; }
+      catch (error) { console.error("LLM hearing summary failed, using heuristic:", error.message); summaryBy = "heuristic-fallback"; }
+    }
+    audit(auth, "庭审小结", `${caseItem?.title || caseId} · ${summaryBy}`, request);
+    return sendJson(response, 200, { summary, summaryBy });
+  }
+
   // 文书 Agent：从案件材料抽取带来源的候选事实。
   if (request.method === "POST" && url.pathname === "/api/documents/facts") {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "export_documents")) return;
@@ -1337,6 +1543,24 @@ async function handleApi(request, response, url) {
   }
 
   // 文书 Agent：法条引用与关键事实校验。
+  // 文书生成：按案件状态生成文书草稿文本（供 Web 应用与 Word/WPS 插件复用）。
+  if (request.method === "POST" && url.pathname === "/api/documents/generate") {
+    if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "export_documents")) return;
+    const body = await readJson(request);
+    const caseId = String(body.caseId || "");
+    const template = String(body.template || "complaint");
+    if (!Object.prototype.hasOwnProperty.call(templateLabels, template)) return sendError(response, 400, "未知文书类型", "TEMPLATE_UNKNOWN");
+    if (!canAccessCase(auth, caseId)) return sendError(response, 404, "案件不存在或无访问权限", "CASE_NOT_FOUND");
+    const state = workspaceState(auth.user.workspaceId);
+    const caseItem = (state.cases || []).find(item => item.id === caseId) || null;
+    if (!caseItem) return sendError(response, 404, "案件不存在", "CASE_NOT_FOUND");
+    const evidence = (state.evidence || []).filter(item => item.caseId === caseId);
+    const assetClues = (state.assetClues || []).filter(item => item.caseId === caseId);
+    const content = renderDocumentTemplate(template, caseItem, evidence, assetClues);
+    audit(auth, "文书生成", `${templateLabels[template]} · ${caseItem.title}`, request);
+    return sendJson(response, 200, { template, label: templateLabels[template], content });
+  }
+
   if (request.method === "POST" && url.pathname === "/api/documents/verify") {
     if (!requireCsrf(request, response, auth) || !requirePermission(response, auth, "export_documents")) return;
     const body = await readJson(request);
@@ -1531,19 +1755,30 @@ async function handleApi(request, response, url) {
   return sendError(response, 404, "API 不存在", "API_NOT_FOUND");
 }
 
+// Word/WPS 办公插件任务窗格的 CSP：仅放行 Office.js 官方 CDN，连接仍限本域。
+const pluginCsp = "default-src 'self'; script-src 'self' https://appsforoffice.microsoft.com https://res.cdn.office.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; base-uri 'none'; frame-ancestors 'self' https://*.officeapps.live.com https://*.office.com https://*.wps.cn https://*.officeonline.wps.cn";
+const pluginFiles = new Set(["plugin/taskpane.html", "plugin/taskpane.js", "plugin/taskpane.css", "plugin/commands.html", "plugin/manifest.xml", "plugin/icon.png"]);
+
 function serveStatic(request, response, url) {
   try {
     const relativePath = url.pathname === "/" ? "index.html" : decodeURIComponent(url.pathname).replace(/^\/+/, "");
-    if (!new Set(["index.html", "styles.css", "app.js"]).has(relativePath)) throw new Error("Not public");
+    const isPlugin = pluginFiles.has(relativePath);
+    if (!new Set(["index.html", "styles.css", "app.js"]).has(relativePath) && !isPlugin) throw new Error("Not public");
     const filePath = path.resolve(root, relativePath);
     if (!filePath.startsWith(`${root}${path.sep}`)) throw new Error("Invalid path");
     const fileStat = statSync(filePath);
     if (!fileStat.isFile()) throw new Error("Not a file");
     const body = readFileSync(filePath);
-    response.writeHead(200, securityHeaders({
+    const headers = securityHeaders({
       "Content-Type": mimeTypes[path.extname(filePath)] || "application/octet-stream",
       "Cache-Control": path.extname(filePath) === ".html" ? "no-cache" : "public, max-age=300"
-    }));
+    });
+    // 插件窗格需被 Office/WPS 宿主框架内嵌：放宽 CSP 并移除 X-Frame-Options。
+    if (isPlugin) {
+      headers["Content-Security-Policy"] = pluginCsp;
+      delete headers["X-Frame-Options"];
+    }
+    response.writeHead(200, headers);
     response.end(request.method === "HEAD" ? undefined : body);
   } catch (error) {
     response.writeHead(404, securityHeaders({ "Content-Type": "text/plain; charset=utf-8" }));
@@ -1589,4 +1824,4 @@ function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-export { db, handleApi, serveStatic, server, runReminderScan, buildReminderDeliveries, purgeOldNotifications, flushWebhookOutbox };
+export { db, handleApi, serveStatic, server, runReminderScan, buildReminderDeliveries, purgeOldNotifications, flushWebhookOutbox, searchPrecedents, tendencyFromPrecedents, localHearingSummary };
